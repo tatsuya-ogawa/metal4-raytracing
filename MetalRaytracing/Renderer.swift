@@ -9,8 +9,12 @@
 import Metal
 import MetalKit
 import MetalFX
+import QuartzCore
 import simd
-
+enum ShadingMode: Int {
+    case pbr = 0
+    case legacy = 1
+}
 class Renderer: NSObject {
     
     let device: MTLDevice
@@ -20,17 +24,49 @@ class Renderer: NSObject {
     let commandAllocators: [MTL4CommandAllocator]
     let library: MTLLibrary
     let computeTable: MTL4ArgumentTable
-    let renderTable: MTL4ArgumentTable
+    var renderTable: MTL4ArgumentTable!
+    var renderTableDesc: MTL4ArgumentTableDescriptor!
+    
+    // Skinning
+    var skinningTable: MTL4ArgumentTable!
+    var skinningPipelineState: MTLComputePipelineState!
+    // Persistent per-skinned-mesh joint matrices buffers (retain across frames)
+    var jointMatrixBuffers: [MTLBuffer] = []
+    // Persistent per-skinned-mesh uniform buffers (vertexCount)
+    var skinningUniformBuffers: [MTLBuffer] = []
+    
+    // Per-mesh skinned buffers.
+    // Key: Mesh identifier (or just simple parallel arrays if efficient)
+    var skinnedVertexBuffers: [MTLBuffer] = []
+    var skinnedNormalBuffers: [MTLBuffer] = []
+    var skinnedPrevVertexBuffers: [MTLBuffer] = []
+    // To map which mesh uses which buffer
+    var skinnedMeshIndices: [Int] = []
+    
+    // Throttle skinning/BLAS updates to a fixed interval.
+    private let skinningDeltaTime: Double = 1.0 / 60.0
+    private var lastSkinningUpdateTime: Double = 0
+    
+    // We need to rebuild BLAS for these meshes
+    // MTL4 AS
+    
     var commandQueueResidencySet: MTLResidencySet?
+    var scratchBuffer: MTLBuffer?
+    
+    // Initial creation flag
+    var useFastBuild = true
     let endFrameEvent: MTLSharedEvent
     let computeEvent: MTLSharedEvent
     var gpuFrameIndex: UInt64 = 0
     
     var scene: Scene
     
+    
+    
+    
     var raytracingPipelineState: MTLComputePipelineState!
     var renderPipelineState: MTLRenderPipelineState!
-        
+    
     var accumulationTargets: [MTLTexture] = []
     var randomTexture: MTLTexture!
     var renderScale: Float = 0.67 { // 0.67 gives better quality/performance balance than 0.5
@@ -44,6 +80,10 @@ class Renderer: NSObject {
     }
     private var depthTexture: MTLTexture?
     private var motionTexture: MTLTexture?
+    private var diffuseAlbedoTexture: MTLTexture?
+    private var specularAlbedoTexture: MTLTexture?
+    private var normalTexture: MTLTexture?
+    private var roughnessTexture: MTLTexture?
     private var metal4Compiler: MTL4Compiler?
     
     var framePresenter: FramePresenter!
@@ -54,6 +94,19 @@ class Renderer: NSObject {
             if oldValue != useTemporalScaler {
                 frameIndex = 0
                 framePresenter.useTemporalScaler = useTemporalScaler
+                
+                if lastDrawableSize.width > 0 && lastDrawableSize.height > 0 {
+                    createTextures(outputSize: lastDrawableSize)
+                }
+            }
+        }
+    }
+
+    var useTemporalDenoiser: Bool = false {
+        didSet {
+            if oldValue != useTemporalDenoiser {
+                frameIndex = 0
+                framePresenter.useTemporalDenoiser = useTemporalDenoiser
                 
                 if lastDrawableSize.width > 0 && lastDrawableSize.height > 0 {
                     createTextures(outputSize: lastDrawableSize)
@@ -86,6 +139,36 @@ class Renderer: NSObject {
             frameIndex = 0
         }
     }
+
+    // Exponential moving average weight for accumulation (0 = no history)
+    var accumulationWeight: Float = 0.9 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    
+    // Reduce history weight based on motion magnitude (per-pixel).
+    var useMotionAdaptiveAccumulation: Bool = true {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionAccumulationMinWeight: Float = 0.1 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionAccumulationLowThresholdPixels: Float = 0.5 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionAccumulationHighThresholdPixels: Float = 4.0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    
     
     // Max ray bounces (higher = more realistic lighting, slower)
     var maxBounces: Int32 = 2 {
@@ -94,15 +177,33 @@ class Renderer: NSObject {
         }
     }
     
+    var debugTextureMode: Int32 = 0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+
+    var shadingMode: ShadingMode = .pbr {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    
+    func setLightIntensity(_ intensity: Float) {
+        scene.setLightIntensity(intensity)
+        frameIndex = 0
+    }
+    
     var uniformBuffer: MTLBuffer!
     var resourcesBuffer: MTLBuffer!
     var instanceDescriptorBuffer: MTLBuffer!
+    var previousInstanceDescriptorBuffer: MTLBuffer!
     
     var instancedAccelarationStructure: MTLAccelerationStructure!
     var primitiveAccelerationStructures: [MTLAccelerationStructure] = []
     
     let maxFramesInFlight = 3
-
+    
     var uniformBufferIndex = 0
     var uniformBufferOffset: Int {
         uniformBufferIndex * MemoryLayout<Uniforms>.stride
@@ -142,20 +243,25 @@ class Renderer: NSObject {
         self.library = device.makeDefaultLibrary()!
         
         let computeTableDesc = MTL4ArgumentTableDescriptor()
-        computeTableDesc.maxBufferBindCount = 10
-        computeTableDesc.maxTextureBindCount = 5
+        computeTableDesc.maxBufferBindCount = 18
+        computeTableDesc.maxTextureBindCount = 12
         self.computeTable = try! device.makeArgumentTable(descriptor: computeTableDesc)
         
         let renderTableDesc = MTL4ArgumentTableDescriptor()
         renderTableDesc.maxTextureBindCount = 1
         self.renderTable = try! device.makeArgumentTable(descriptor: renderTableDesc)
         
+        // Skinning Table
+        let skinningTableDesc = MTL4ArgumentTableDescriptor()
+        skinningTableDesc.maxBufferBindCount = 20 // Covers indices 10-16
+        self.skinningTable = try! device.makeArgumentTable(descriptor: skinningTableDesc)
+        
         self.endFrameEvent = device.makeSharedEvent()!
         self.computeEvent = device.makeSharedEvent()!
         self.gpuFrameIndex = UInt64(maxFramesInFlight)
         self.endFrameEvent.signaledValue = UInt64(maxFramesInFlight - 1)
         
-        self.scene = DragonScene(size: size, device: device)
+        self.scene = AppScene(size: size, device: device)
         self.cameraTarget = scene.cameraTarget
         self.cameraAzimuth = scene.cameraAzimuth
         self.cameraElevation = scene.cameraElevation
@@ -163,20 +269,28 @@ class Renderer: NSObject {
         self.cameraFovDegrees = scene.cameraFovDegrees
         
         super.init()
-
+        
         createBuffers()
         createPipelineStates(metalView: metalView)
-
+        
         if canUseMTL4AccelerationStructures(device: device){
             self.framePresenter = MTL4UpScaleRenderer(device: device, library: library, endFrameEvent: endFrameEvent, commandQueue: self.commandQueue, metal4Compiler: self.metal4Compiler!)!
         }else{
-            self.framePresenter = LegacyFramePresenter(renderer: LecacyUpScaleRenderer(device: device, library: library, endFrameEvent: endFrameEvent)!, commandQueue: self.commandQueue)
+            self.framePresenter = LegacyFramePresenter(renderer: LecacyUpScaleRenderer(device: device, library: library, commandQueue: legacyCommandQueue, endFrameEvent: endFrameEvent)!, commandQueue: self.commandQueue)
         }
+        self.framePresenter.useTemporalScaler = useTemporalScaler
+        self.framePresenter.useTemporalDenoiser = useTemporalDenoiser
+        self.framePresenter.isMetalFXEnabled = isMetalFXEnabled
+        
+        // Set player model index if needed, e.g. find "Dragon" or just 0
+        //        if !scene.models.isEmpty {
+        //            playerModelIndex = 0 // Control the first model
+        //        }
         
         if canUseMTL4AccelerationStructures(device: device){
             createMTL4AccelerationStructures()
         }else{
-            createAccelerationStructures()
+            createLegacyAccelerationStructures()
         }
         
         mtkView(metalView, drawableSizeWillChange: size)
@@ -226,12 +340,22 @@ class Renderer: NSObject {
         }
         
         print(raytracingPipelineState.threadExecutionWidth,
-        raytracingPipelineState.maxTotalThreadsPerThreadgroup,
-        raytracingPipelineState.staticThreadgroupMemoryLength)
+              raytracingPipelineState.maxTotalThreadsPerThreadgroup,
+              raytracingPipelineState.staticThreadgroupMemoryLength)
+        
+        // Skinning Pipeline
+        do {
+            guard let skinningFunction = library.makeFunction(name: "skinningKernel") else {
+                fatalError("Could not find skinningKernel")
+            }
+            skinningPipelineState = try device.makeComputePipelineState(function: skinningFunction)
+        } catch {
+            fatalError("Could not create skinning pipeline: \(error)")
+        }
     }
-
+    
     func createBuffers() {
-        uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride * maxFramesInFlight, options: .storageModeShared)!
+        uniformBuffer = device.makeBuffer(length: MemoryLayout<Uniforms>.stride * maxFramesInFlight, options: CommonStorageMode.options)!
         uniformBuffer.label = "Uniform Buffer"
         
         self.resourceStride = 0
@@ -265,20 +389,121 @@ class Renderer: NSObject {
                     }
                 }
             }
+            
+        }
+        
+        // Create skinned buffers (and persistent per-mesh uniform buffers)
+        skinnedVertexBuffers.removeAll(keepingCapacity: true)
+        skinnedNormalBuffers.removeAll(keepingCapacity: true)
+        skinnedPrevVertexBuffers.removeAll(keepingCapacity: true)
+        skinnedMeshIndices.removeAll(keepingCapacity: true)
+        skinningUniformBuffers.removeAll(keepingCapacity: true)
+        jointMatrixBuffers.removeAll(keepingCapacity: true)
+        
+        for (i, model) in scene.models.enumerated() {
+            for mesh in model.meshes {
+                if mesh.hasSkinning {
+                    let jointCount: Int
+                    if let skinning = mesh.skinning, !skinning.jointPaths.isEmpty {
+                        jointCount = skinning.jointPaths.count
+                    } else if let skeleton = model.skeleton {
+                        jointCount = skeleton.restTransforms.count
+                    } else {
+                        jointCount = 0
+                    }
+                    let safeJointCount = max(1, jointCount)
+                    let jointLength = safeJointCount * MemoryLayout<matrix_float4x4>.stride
+                    let jointBuffer = device.makeBuffer(length: jointLength, options: CommonStorageMode.options)!
+                    jointBuffer.label = "Joint Matrices - model\(i)"
+                    let jointPointer = jointBuffer.contents().bindMemory(to: matrix_float4x4.self, capacity: safeJointCount)
+                    for j in 0..<safeJointCount {
+                        jointPointer[j] = matrix_identity_float4x4
+                    }
+#if os(macOS)
+                    jointBuffer.didModifyRange(0..<jointLength)
+#endif
+                    
+                    // Create destination buffers
+                    let vertexCount = mesh.mtkMesh.vertexCount
+                    let posSize = vertexCount * MemoryLayout<SIMD3<Float>>.stride
+                    
+                    let posBuffer = device.makeBuffer(length: posSize, options: .storageModePrivate)!
+                    posBuffer.label = "Skinned Position - model\(i)"
+                    
+                    let prevPosBuffer = device.makeBuffer(length: posSize, options: .storageModePrivate)!
+                    prevPosBuffer.label = "Skinned Prev Position - model\(i)"
+                    
+                    let nrmBuffer = device.makeBuffer(length: posSize, options: .storageModePrivate)!
+                    nrmBuffer.label = "Skinned Normal - model\(i)"
+                    
+                    var vertexCountU32 = UInt32(vertexCount)
+                    let uniformBuffer = device.makeBuffer(bytes: &vertexCountU32,
+                                                          length: MemoryLayout<UInt32>.stride,
+                                                          options: CommonStorageMode.options)!
+                    uniformBuffer.label = "Skinning Uniforms - model\(i)"
+                    
+#if os(macOS)
+                    uniformBuffer.didModifyRange(0..<uniformBuffer.length)
+#endif
+                    
+                    skinnedVertexBuffers.append(posBuffer)
+                    skinnedPrevVertexBuffers.append(prevPosBuffer)
+                    skinnedNormalBuffers.append(nrmBuffer)
+                    skinningUniformBuffers.append(uniformBuffer)
+                    jointMatrixBuffers.append(jointBuffer)
+                    skinnedMeshIndices.append(skinnedMeshIndices.count) // Just tracking existence for now
+                } else {
+                    // Keep placeholders to align indices or handle differently
+                    // Simplest is to only store for skinned meshes and track the mapping
+                }
+            }
+        }
+        
+        // For skinned meshes, point the normal resource at the skinned normal buffer
+        // (the buffer pointer is stable; only its contents change each frame).
+        var meshIndex = 0
+        var skinnedIndex = 0
+        for model in scene.models {
+            for mesh in model.meshes {
+                if mesh.hasSkinning {
+                    for (submeshIndex, submesh) in mesh.submeshes.enumerated() {
+                        let index = meshIndex * maxSubmeshes + submeshIndex
+                        let offset = resourceStride * index
+                        guard let encoder = device.makeArgumentEncoder(for: submesh.resources) else { continue }
+                        encoder.setArgumentBuffer(resourcesBuffer, offset: offset)
+                        encoder.setBuffer(skinnedVertexBuffers[skinnedIndex], offset: 0, index: 0)
+                        encoder.setBuffer(skinnedPrevVertexBuffers[skinnedIndex], offset: 0, index: 1)
+                        encoder.setBuffer(skinnedNormalBuffers[skinnedIndex], offset: 0, index: 2)
+                        encoder.setBuffer(submesh.indexBuffer, offset: 0, index: 3)
+                        encoder.setBuffer(submesh.materialBuffer, offset: 0, index: 4)
+#if os(macOS)
+                        resourcesBuffer.didModifyRange(offset..<(offset + resourceStride))
+#endif
+                    }
+                    skinnedIndex += 1
+                }
+                meshIndex += 1
+            }
         }
         
 #if os(macOS)
         resourcesBuffer.didModifyRange(0..<resourcesBuffer.length)
 #endif
+        
+        
+        // Create scratch buffer for AS rebuilds
+        // Size estimation: 32MB should be enough for dynamic updates, but for safety lets go slightly larger or use a heuristic
+        scratchBuffer = device.makeBuffer(length: 1024 * 1024 * 64, options: .storageModePrivate)
+        scratchBuffer?.label = "AS Scractch Buffer"
     }
-
-    func createAccelerationStructures() {
+    
+    func createLegacyAccelerationStructures() {
         let primitiveAccelerationStructureDescriptors = scene.models.flatMap(\.meshes).map { mesh -> MTLPrimitiveAccelerationStructureDescriptor in
             let descriptor = MTLPrimitiveAccelerationStructureDescriptor()
             descriptor.geometryDescriptors = mesh.geometryDescriptors
             return descriptor
         }
-               
+        
         self.primitiveAccelerationStructures = legacyCommandQueue.buildCompactedAccelerationStructures(for: primitiveAccelerationStructureDescriptors)
         
         var instanceDescriptors = scene.models.flatMap(\.meshes).enumerated().map { index, mesh -> MTLIndirectAccelerationStructureInstanceDescriptor in
@@ -286,12 +511,22 @@ class Renderer: NSObject {
             descriptor.accelerationStructureID = primitiveAccelerationStructures[index].gpuResourceID
             descriptor.mask = 0xFF
             descriptor.options = []
-            descriptor.transformationMatrix = .matrix4x4_drop_last_row(mesh.transform)
+            descriptor.transformationMatrix = packedFloat4x3(from: mesh.transform)
             return descriptor
         }
         
         self.instanceDescriptorBuffer = device.makeBuffer(bytes: &instanceDescriptors, length: MemoryLayout<MTLIndirectAccelerationStructureInstanceDescriptor>.stride * scene.models.flatMap(\.meshes).count, options: CommonStorageMode.options)
         self.instanceDescriptorBuffer?.label = "Instance Descriptor Buffer"
+        if let instanceDescriptorBuffer {
+            previousInstanceDescriptorBuffer = device.makeBuffer(length: instanceDescriptorBuffer.length, options: CommonStorageMode.options)
+            previousInstanceDescriptorBuffer?.label = "Previous Instance Descriptor Buffer"
+            if let previousInstanceDescriptorBuffer {
+                memcpy(previousInstanceDescriptorBuffer.contents(), instanceDescriptorBuffer.contents(), instanceDescriptorBuffer.length)
+#if os(macOS)
+                previousInstanceDescriptorBuffer.didModifyRange(0..<instanceDescriptorBuffer.length)
+#endif
+            }
+        }
         
         let instanceAccelerationStructureDescriptor = MTLInstanceAccelerationStructureDescriptor()
         let instanceCount = scene.models.reduce(0) { result, model in
@@ -303,21 +538,93 @@ class Renderer: NSObject {
         
         instancedAccelarationStructure = legacyCommandQueue.buildCompactedAccelerationStructure(with: instanceAccelerationStructureDescriptor)!
     }
+    let initialSkinning = true
     func createMTL4AccelerationStructures() {
         // Ensure mesh buffers are resident before building primitive AS
         rebuildResidencySet()
         
-        let primitiveAccelerationStructureDescriptors = scene.models.flatMap(\.meshes).map { mesh -> MTL4PrimitiveAccelerationStructureDescriptor in
+        let allMeshes = scene.models.flatMap(\.meshes)
+        
+        if initialSkinning{
+            // Initial skinning pass to populate skinned vertex buffers
+            if let commandBuffer = device.makeCommandBuffer(),
+               let allocator = device.makeCommandAllocator() {
+                commandBuffer.label = "Initial Skinning"
+                commandBuffer.beginCommandBuffer(allocator: allocator)
+                if let residencySet = commandQueueResidencySet {
+                    commandBuffer.useResidencySet(residencySet)
+                }
+                
+                // Ensure models are updated to initial state (rest pose or time 0)
+                for model in scene.models {
+                    model.update(deltaTime: 0)
+                }
+                performSkinning(commandBuffer: commandBuffer)
+                
+                commandBuffer.endCommandBuffer()
+                commandQueue.commit([commandBuffer])
+                
+                let event = device.makeSharedEvent()!
+                event.signaledValue = 0
+                commandQueue.signalEvent(event, value: 1)
+                while !event.wait(untilSignaledValue: 1, timeoutMS: 1000) {}
+            }
+        }
+        
+        // Build compacted AS for static meshes
+        var staticIndices: [Int] = []
+        var skinnedIndices: [Int] = []
+        
+        for (index, mesh) in allMeshes.enumerated() {
+            if mesh.hasSkinning {
+                skinnedIndices.append(index)
+            } else {
+                staticIndices.append(index)
+            }
+        }
+        
+        // Build compacted AS for static meshes
+        let staticDescriptors = staticIndices.map { index -> MTL4PrimitiveAccelerationStructureDescriptor in
             let descriptor = MTL4PrimitiveAccelerationStructureDescriptor()
-            descriptor.geometryDescriptors = mesh.geometryDescriptorsMTL4
+            descriptor.geometryDescriptors = allMeshes[index].geometryDescriptorsMTL4
             return descriptor
         }
-
-        self.primitiveAccelerationStructures = commandQueue.buildCompactedAccelerationStructures(for: primitiveAccelerationStructureDescriptors, residencySet: commandQueueResidencySet)
-
-        var instanceDescriptors = scene.models.flatMap(\.meshes).enumerated().map { index, mesh -> MTLIndirectAccelerationStructureInstanceDescriptor in
+        
+        let staticAS = staticDescriptors.isEmpty ? [] : commandQueue.buildCompactedAccelerationStructures(for: staticDescriptors, residencySet: commandQueueResidencySet)
+        
+        // Build UNCOMPACTED AS for skinned meshes (need full size for rebuild)
+        // Use skinnedVertexBuffers which should now be populated by the initial skinning pass
+        let skinnedDescriptors = skinnedIndices.enumerated().map { (offset, index) -> MTL4PrimitiveAccelerationStructureDescriptor in
+            // Fallback to source mesh (T-Pose) if initial skinning is skipped
+            if !initialSkinning {
+                let descriptor = MTL4PrimitiveAccelerationStructureDescriptor()
+                descriptor.geometryDescriptors = allMeshes[index].geometryDescriptorsMTL4
+                return descriptor
+            }
+            return makePrimitiveDescriptor(mesh: allMeshes[index], vertexBuffer: skinnedVertexBuffers[offset])
+        }
+        
+        let skinnedAS = skinnedDescriptors.isEmpty ? [] : commandQueue.buildAccelerationStructures(for: skinnedDescriptors, residencySet: commandQueueResidencySet)
+        
+        
+        
+        // Merge back in original order
+        self.primitiveAccelerationStructures = []
+        var staticCursor = 0
+        var skinnedCursor = 0
+        for (_, mesh) in allMeshes.enumerated() {
+            if mesh.hasSkinning {
+                primitiveAccelerationStructures.append(skinnedAS[skinnedCursor])
+                skinnedCursor += 1
+            } else {
+                primitiveAccelerationStructures.append(staticAS[staticCursor])
+                staticCursor += 1
+            }
+        }
+        
+        var instanceDescriptors = allMeshes.enumerated().map { index, mesh -> MTLIndirectAccelerationStructureInstanceDescriptor in
             var descriptor = MTLIndirectAccelerationStructureInstanceDescriptor()
-            descriptor.transformationMatrix = .matrix4x4_drop_last_row(mesh.transform)
+            descriptor.transformationMatrix = packedFloat4x3(from: mesh.transform)
             descriptor.mask = 0xFF
             descriptor.options = []
             descriptor.intersectionFunctionTableOffset = 0
@@ -325,11 +632,21 @@ class Renderer: NSObject {
             descriptor.accelerationStructureID = primitiveAccelerationStructures[index].gpuResourceID
             return descriptor
         }
-
+        
         self.instanceDescriptorBuffer = device.makeBuffer(bytes: &instanceDescriptors,
                                                           length: MemoryLayout<MTLIndirectAccelerationStructureInstanceDescriptor>.stride * instanceDescriptors.count,
                                                           options: CommonStorageMode.options)
         self.instanceDescriptorBuffer?.label = "Instance Descriptor Buffer"
+        if let instanceDescriptorBuffer {
+            previousInstanceDescriptorBuffer = device.makeBuffer(length: instanceDescriptorBuffer.length, options: CommonStorageMode.options)
+            previousInstanceDescriptorBuffer?.label = "Previous Instance Descriptor Buffer"
+            if let previousInstanceDescriptorBuffer {
+                memcpy(previousInstanceDescriptorBuffer.contents(), instanceDescriptorBuffer.contents(), instanceDescriptorBuffer.length)
+#if os(macOS)
+                previousInstanceDescriptorBuffer.didModifyRange(0..<instanceDescriptorBuffer.length)
+#endif
+            }
+        }
 #if os(macOS)
         if let instanceDescriptorBuffer {
             instanceDescriptorBuffer.didModifyRange(0..<instanceDescriptorBuffer.length)
@@ -356,11 +673,36 @@ class Renderer: NSObject {
             instanceAccelerationStructureDescriptor.instanceDescriptorBuffer = MTL4BufferRange(bufferAddress: instanceDescriptorBuffer.gpuAddress,
                                                                                                length: UInt64(instanceDescriptorBuffer.length))
         }
-
-        instancedAccelarationStructure = commandQueue.buildCompactedAccelerationStructure(with: instanceAccelerationStructureDescriptor, residencySet: commandQueueResidencySet)!
+        
+        // Build un-compacted TLAS when refit isn't supported so rebuilds have enough size.
+        let instanceSizes = device.accelerationStructureSizes(descriptor: instanceAccelerationStructureDescriptor)
+        if instanceSizes.refitScratchBufferSize == 0 {
+            instancedAccelarationStructure = commandQueue.buildAccelerationStructures(for: [instanceAccelerationStructureDescriptor], residencySet: commandQueueResidencySet).first!
+        } else {
+            instancedAccelarationStructure = commandQueue.buildCompactedAccelerationStructure(with: instanceAccelerationStructureDescriptor, residencySet: commandQueueResidencySet)!
+        }
     }
     
     func updateUniforms(size: CGSize) {
+        if viewMode == .tps {
+            if scene.models.indices.contains(playerModelIndex) {
+                let player = scene.models[playerModelIndex]
+                // Target is player position + some height (e.g. 1.0 for center of body)
+                cameraTarget = player.position + SIMD3<Float>(0, 1.0, 0)
+            }
+        } else {
+            // In World mode, we might want to default to (0,0,0) or keep existing.
+            // The original logic just used 'scene.cameraTarget' which was initialized to (0,0,0).
+            // But if we switched FROM tps, we might want to reset or stay.
+            // Let's reset to scene.cameraTarget (0,0,0) if we want "original".
+            // However, scene.cameraTarget is not updated by orbit. Orbit updates renderer.camera[Azimuth/etc].
+            // cameraTarget is a property of Renderer now (copied from scene in init).
+            // Let's just not force it in World mode, but ensure it's (0,0,0) if we want "World" to mean "Center".
+            // For now, let's reset it to (0,0,0) only if we strictly want "World Original".
+            // Since the user said "world(original one)", I'll assume they mean looking at origin.
+            cameraTarget = SIMD3<Float>(0, 0, 0)
+        }
+        
         scene.updateUniforms(size: size,
                              target: cameraTarget,
                              azimuth: cameraAzimuth,
@@ -379,7 +721,16 @@ class Renderer: NSObject {
         uniforms.pointee.blocksWide = ((uniforms.pointee.width) + 15) / 16
         uniforms.pointee.frameIndex = frameIndex
         uniforms.pointee.samplesPerPixel = samplesPerPixel
+        uniforms.pointee.samplesPerPixel = samplesPerPixel
         uniforms.pointee.maxBounces = maxBounces
+        uniforms.pointee.debugTextureMode = debugTextureMode
+        uniforms.pointee.accumulationWeight = accumulationWeight
+        uniforms.pointee.enableDenoiseGBuffer = useTemporalDenoiser ? 1 : 0
+        uniforms.pointee.shadingMode = Int32(shadingMode.rawValue)
+        uniforms.pointee.enableMotionAdaptiveAccumulation = useMotionAdaptiveAccumulation ? 1 : 0
+        uniforms.pointee.motionAccumulationMinWeight = motionAccumulationMinWeight
+        uniforms.pointee.motionAccumulationLowThresholdPixels = motionAccumulationLowThresholdPixels
+        uniforms.pointee.motionAccumulationHighThresholdPixels = motionAccumulationHighThresholdPixels
         frameIndex += 1
         
         // Save current camera for next frame
@@ -389,38 +740,38 @@ class Renderer: NSObject {
     private func clampedRenderScale() -> Float {
         return renderScale
     }
-
+    
     private func scaledSize(for outputSize: CGSize, scale: Float) -> CGSize {
         let width = max(1, Int(round(outputSize.width * CGFloat(scale))))
         let height = max(1, Int(round(outputSize.height * CGFloat(scale))))
         return CGSize(width: width, height: height)
     }
-
+    
     func createTextures(outputSize: CGSize) {
         let outputWidth = Int(outputSize.width)
         let outputHeight = Int(outputSize.height)
         guard outputWidth > 0, outputHeight > 0 else {
             return
         }
-
+        
         let desiredScale = clampedRenderScale()
         let inputSize = scaledSize(for: outputSize, scale: desiredScale)
         let colorFormat: MTLPixelFormat = .rgba32Float
-
+        
         let inputWidth = Int(inputSize.width)
         let inputHeight = Int(inputSize.height)
         guard inputWidth > 0, inputHeight > 0 else {
             return
         }
-
+        
         let inputUsage: MTLTextureUsage = [.shaderRead, .shaderWrite]
-
+        
         let descriptor = MTLTextureDescriptor()
         descriptor.pixelFormat = colorFormat
         descriptor.textureType = .type2D
         descriptor.width = inputWidth
         descriptor.height = inputHeight
-
+        
         // Stored in private memory because only the GPU will read or write this texture.
         descriptor.storageMode = .private
         descriptor.usage = inputUsage
@@ -428,14 +779,14 @@ class Renderer: NSObject {
         accumulationTargets = [device.makeTexture(descriptor: descriptor)!, device.makeTexture(descriptor: descriptor)!]
         accumulationTargets[0].label = "Accumulation Texture 1"
         accumulationTargets[1].label = "Accumulation Texture 2"
-
+        
         // Create a texture containing a random integer value for each pixel. the sample
         // uses these values to decorrelate pixels while drawing pseudorandom numbers from the
         // Halton sequence.
         descriptor.pixelFormat = .r32Uint
         descriptor.usage = .shaderRead
         descriptor.storageMode = .shared
-
+        
         randomTexture = device.makeTexture(descriptor: descriptor)
         randomTexture.label = "Random Texture"
         
@@ -459,7 +810,7 @@ class Renderer: NSObject {
                 bytesPerRow: MemoryLayout<UInt32>.stride * randomTexture.width
             )
         }
-
+        
         // Create depth and motion textures (always needed for shader)
         let depthDescriptor = MTLTextureDescriptor()
         depthDescriptor.pixelFormat = .r32Float
@@ -481,11 +832,51 @@ class Renderer: NSObject {
         motionTexture = device.makeTexture(descriptor: motionDescriptor)
         motionTexture?.label = "Motion Texture"
 
+        let diffuseDescriptor = MTLTextureDescriptor()
+        diffuseDescriptor.pixelFormat = .rgba16Float
+        diffuseDescriptor.textureType = .type2D
+        diffuseDescriptor.width = inputWidth
+        diffuseDescriptor.height = inputHeight
+        diffuseDescriptor.storageMode = .private
+        diffuseDescriptor.usage = [.shaderRead, .shaderWrite]
+        diffuseAlbedoTexture = device.makeTexture(descriptor: diffuseDescriptor)
+        diffuseAlbedoTexture?.label = "Diffuse Albedo Texture"
+
+        let specularDescriptor = MTLTextureDescriptor()
+        specularDescriptor.pixelFormat = .rgba16Float
+        specularDescriptor.textureType = .type2D
+        specularDescriptor.width = inputWidth
+        specularDescriptor.height = inputHeight
+        specularDescriptor.storageMode = .private
+        specularDescriptor.usage = [.shaderRead, .shaderWrite]
+        specularAlbedoTexture = device.makeTexture(descriptor: specularDescriptor)
+        specularAlbedoTexture?.label = "Specular Albedo Texture"
+
+        let normalDescriptor = MTLTextureDescriptor()
+        normalDescriptor.pixelFormat = .rgba16Float
+        normalDescriptor.textureType = .type2D
+        normalDescriptor.width = inputWidth
+        normalDescriptor.height = inputHeight
+        normalDescriptor.storageMode = .private
+        normalDescriptor.usage = [.shaderRead, .shaderWrite]
+        normalTexture = device.makeTexture(descriptor: normalDescriptor)
+        normalTexture?.label = "Normal Texture"
+
+        let roughnessDescriptor = MTLTextureDescriptor()
+        roughnessDescriptor.pixelFormat = .r16Float
+        roughnessDescriptor.textureType = .type2D
+        roughnessDescriptor.width = inputWidth
+        roughnessDescriptor.height = inputHeight
+        roughnessDescriptor.storageMode = .private
+        roughnessDescriptor.usage = [.shaderRead, .shaderWrite]
+        roughnessTexture = device.makeTexture(descriptor: roughnessDescriptor)
+        roughnessTexture?.label = "Roughness Texture"
+        
         lastDrawableSize = outputSize
         framePresenter.createTextures(outputSize: outputSize, colorFormat: colorFormat, renderSize: inputSize, accumulationTargets: accumulationTargets)
         rebuildResidencySet()
     }
-
+    
     private func rebuildResidencySet() {
         let residencySetDesc = MTLResidencySetDescriptor()
         residencySetDesc.initialCapacity = 64  // Increased to accommodate all allocations
@@ -499,6 +890,9 @@ class Renderer: NSObject {
         if let instanceDescriptorBuffer {
             allocations.append(instanceDescriptorBuffer)
         }
+        if let previousInstanceDescriptorBuffer {
+            allocations.append(previousInstanceDescriptorBuffer)
+        }
         allocations.append(scene.lightBuffer)
         if let randomTexture {
             allocations.append(randomTexture)
@@ -509,16 +903,48 @@ class Renderer: NSObject {
         if let motionTexture {
             allocations.append(motionTexture)
         }
+        if let diffuseAlbedoTexture {
+            allocations.append(diffuseAlbedoTexture)
+        }
+        if let specularAlbedoTexture {
+            allocations.append(specularAlbedoTexture)
+        }
+        if let normalTexture {
+            allocations.append(normalTexture)
+        }
+        if let roughnessTexture {
+            allocations.append(roughnessTexture)
+        }
         for texture in accumulationTargets {
             allocations.append(texture)
+        }
+        if let mtl4Presenter = framePresenter as? MTL4UpScaleRenderer,
+           let upscaledTexture = mtl4Presenter.upscaledTexture {
+            allocations.append(upscaledTexture)
         }
         for model in scene.models {
             for mesh in model.meshes {
                 allocations.append(mesh.vertexBuffer)
                 allocations.append(mesh.normalBuffer)
+                if let uvBuffer = mesh.uvBuffer {
+                    allocations.append(uvBuffer)
+                }
+                if let jointIndexBuffer = mesh.jointIndexBuffer {
+                    allocations.append(jointIndexBuffer)
+                }
+                if let jointWeightBuffer = mesh.jointWeightBuffer {
+                    allocations.append(jointWeightBuffer)
+                }
                 for submesh in mesh.submeshes {
                     allocations.append(submesh.indexBuffer)
                     allocations.append(submesh.materialBuffer)
+                    allocations.append(submesh.baseColorTexture)
+                    allocations.append(submesh.normalMapTexture)
+                    allocations.append(submesh.roughnessTexture)
+                    allocations.append(submesh.metallicTexture)
+                    allocations.append(submesh.aoTexture)
+                    allocations.append(submesh.opacityTexture)
+                    allocations.append(submesh.emissionTexture)
                 }
             }
         }
@@ -527,6 +953,25 @@ class Renderer: NSObject {
         }
         if let instancedAccelarationStructure {
             allocations.append(instancedAccelarationStructure)
+        }
+        
+        if let scratchBuffer {
+            allocations.append(scratchBuffer)
+        }
+        for buffer in skinnedVertexBuffers {
+            allocations.append(buffer)
+        }
+        for buffer in skinnedPrevVertexBuffers {
+            allocations.append(buffer)
+        }
+        for buffer in skinnedNormalBuffers {
+            allocations.append(buffer)
+        }
+        for buffer in skinningUniformBuffers {
+            allocations.append(buffer)
+        }
+        for buffer in jointMatrixBuffers {
+            allocations.append(buffer)
         }
         
         residencySet.addAllocations(allocations)
@@ -542,6 +987,12 @@ class Renderer: NSObject {
     }
     
     func update(size: CGSize) {
+        // isSceneDirty handled in updateSkinningAndBLAS now, or we can trigger it differently
+        // But updateSkinningAndBLAS is likely called in draw().
+        // Let's ensure frameIndex is reset if dirty here if needed, or leave it to updateSkinningAndBLAS.
+        // Actually, updateSkinningAndBLAS is called later.
+        // Just remove the explicit updateAccelerationStructures call.
+        
         uniformBufferIndex = (uniformBufferIndex + 1) % maxFramesInFlight
         updateUniforms(size: size)
     }
@@ -557,8 +1008,443 @@ class Renderer: NSObject {
         case isometric
     }
     
+    enum ViewMode {
+        case world
+        case tps
+    }
+    
+    var viewMode: ViewMode = .world {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    
+    var playerModelIndex: Int = 0
+    
+    @discardableResult
+    func updateSkinningJointMatrices(model: Model, mesh: Mesh, destinationBuffer: MTLBuffer) -> Int {
+        let stride = MemoryLayout<matrix_float4x4>.stride
+        let capacity = destinationBuffer.length / stride
+        guard capacity > 0 else { return 0 }
+        
+        let skinMatrices = model.jointMatrices
+        let mapping = mesh.skinning?.jointToSkeletonIndex ?? []
+        let geometryBind = mesh.skinning?.geometryBindTransform ?? matrix_identity_float4x4
+        let geometryBindInverse = mesh.skinning?.geometryBindTransformInverse ?? matrix_identity_float4x4
+        
+        let jointCount = min(capacity, mapping.isEmpty ? max(1, skinMatrices.count) : mapping.count)
+        let dst = destinationBuffer.contents().bindMemory(to: matrix_float4x4.self, capacity: jointCount)
+        
+        if skinMatrices.isEmpty {
+            for i in 0..<jointCount {
+                dst[i] = matrix_identity_float4x4
+            }
+        } else {
+            for i in 0..<jointCount {
+                let skeletonIndex = mapping.isEmpty ? i : mapping[i]
+                let skinMatrix: matrix_float4x4
+                if skeletonIndex >= 0 && skeletonIndex < skinMatrices.count {
+                    skinMatrix = skinMatrices[skeletonIndex]
+                } else {
+                    skinMatrix = matrix_identity_float4x4
+                }
+                dst[i] = simd_mul(geometryBindInverse, simd_mul(skinMatrix, geometryBind))
+            }
+        }
+#if os(macOS)
+        destinationBuffer.didModifyRange(0..<(jointCount * stride))
+#endif
+        return jointCount
+    }
+    
+    /// Dispatch skinning kernel for all skinned meshes using provided encoder
+    private func dispatchSkinning(computeEncoder: MTL4ComputeCommandEncoder) {
+        computeEncoder.setComputePipelineState(skinningPipelineState)
+        
+        var skinnedIndex = 0
+        for model in scene.models {
+            for mesh in model.meshes where mesh.hasSkinning {
+                guard skinnedIndex < jointMatrixBuffers.count else { continue }
+                
+                // Joint matrices
+                let jointBuffer = jointMatrixBuffers[skinnedIndex]
+                updateSkinningJointMatrices(model: model, mesh: mesh, destinationBuffer: jointBuffer)
+                skinningTable.setAddress(jointBuffer.gpuAddress, index: BufferIndex.jointMatrices.rawValue)
+                
+                // Source buffers
+                let restPositionsVB = mesh.mtkMesh.vertexBuffers[0]
+                let restNormalsVB = mesh.mtkMesh.vertexBuffers[1]
+                skinningTable.setAddress(restPositionsVB.buffer.gpuAddress + UInt64(restPositionsVB.offset),
+                                         index: BufferIndex.restPositions.rawValue)
+                skinningTable.setAddress(restNormalsVB.buffer.gpuAddress + UInt64(restNormalsVB.offset),
+                                         index: BufferIndex.restNormals.rawValue)
+                
+                if mesh.mtkMesh.vertexBuffers.count > 2 {
+                    let jointIndexVB = mesh.mtkMesh.vertexBuffers[2]
+                    skinningTable.setAddress(jointIndexVB.buffer.gpuAddress + UInt64(jointIndexVB.offset),
+                                             index: BufferIndex.jointIndices.rawValue)
+                }
+                if mesh.mtkMesh.vertexBuffers.count > 3 {
+                    let jointWeightVB = mesh.mtkMesh.vertexBuffers[3]
+                    skinningTable.setAddress(jointWeightVB.buffer.gpuAddress + UInt64(jointWeightVB.offset),
+                                             index: BufferIndex.jointWeights.rawValue)
+                }
+                
+                // Destination buffers
+                let destPos = skinnedVertexBuffers[skinnedIndex]
+                let destNrm = skinnedNormalBuffers[skinnedIndex]
+                skinningTable.setAddress(destPos.gpuAddress, index: BufferIndex.skinnedPositions.rawValue)
+                skinningTable.setAddress(destNrm.gpuAddress, index: BufferIndex.skinnedNormals.rawValue)
+                
+                // Uniforms
+                skinningTable.setAddress(skinningUniformBuffers[skinnedIndex].gpuAddress, index: BufferIndex.uniforms.rawValue)
+                
+                // Dispatch
+                computeEncoder.setArgumentTable(skinningTable)
+                let vertexCount = mesh.mtkMesh.vertexCount
+                let threadsPerGrid = MTLSize(width: vertexCount, height: 1, depth: 1)
+                let threadsPerGroup = MTLSize(width: min(vertexCount, skinningPipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
+                computeEncoder.dispatchThreads(threadsPerGrid: threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
+                
+                skinnedIndex += 1
+            }
+        }
+    }
+    
+    func performSkinning(commandBuffer: MTL4CommandBuffer) {
+        let skinnedMeshes = scene.models.flatMap { $0.meshes }.filter { $0.hasSkinning }
+        if skinnedMeshes.isEmpty { return }
+        
+        guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        computeEncoder.label = "Skinning"
+        dispatchSkinning(computeEncoder: computeEncoder)
+        computeEncoder.endEncoding()
+    }
+    
+    func updateSceneTimeAndAnimation() -> Bool {
+        // 1. Update Animation Time & Matrices
+        let now = CACurrentMediaTime()
+        if lastSkinningUpdateTime == 0 {
+            // Force an update on the first call.
+            lastSkinningUpdateTime = now - skinningDeltaTime
+        }
+        let elapsed = now - lastSkinningUpdateTime
+        guard elapsed >= skinningDeltaTime || scene.isDirty else { return false }
+        
+        // Reset dirty flag if we proceeding
+        if scene.isDirty {
+            scene.isDirty = false
+        }
+        
+        let steps = Int(elapsed / skinningDeltaTime)
+        let deltaTime = skinningDeltaTime * Double(steps)
+        if steps > 0 {
+            lastSkinningUpdateTime += skinningDeltaTime * Double(steps)
+        }
+        for model in scene.models {
+            model.update(deltaTime: deltaTime)
+        }
+        return true
+    }
+
+    func updateInstanceDescriptors() {
+        if let instanceDescriptorBuffer {
+            if let previousInstanceDescriptorBuffer {
+                memcpy(previousInstanceDescriptorBuffer.contents(), instanceDescriptorBuffer.contents(), instanceDescriptorBuffer.length)
+#if os(macOS)
+                previousInstanceDescriptorBuffer.didModifyRange(0..<instanceDescriptorBuffer.length)
+#endif
+            }
+            let allMeshes = scene.models.flatMap(\.meshes)
+            if canUseMTL4AccelerationStructures(device: device) {
+                var instanceDescriptors = allMeshes.enumerated().map { index, mesh -> MTLIndirectAccelerationStructureInstanceDescriptor in
+                    var descriptor = MTLIndirectAccelerationStructureInstanceDescriptor()
+                    descriptor.transformationMatrix = packedFloat4x3(from: mesh.transform)
+                    descriptor.mask = 0xFF
+                    descriptor.options = []
+                    descriptor.intersectionFunctionTableOffset = 0
+                    descriptor.userID = 0
+                    descriptor.accelerationStructureID = primitiveAccelerationStructures[index].gpuResourceID
+                    return descriptor
+                }
+                instanceDescriptorBuffer.contents().copyMemory(from: &instanceDescriptors, byteCount: instanceDescriptors.count * MemoryLayout<MTLIndirectAccelerationStructureInstanceDescriptor>.stride)
+            } else {
+                var instanceDescriptors = allMeshes.enumerated().map { index, mesh -> MTLIndirectAccelerationStructureInstanceDescriptor in
+                    var descriptor = MTLIndirectAccelerationStructureInstanceDescriptor()
+                    descriptor.accelerationStructureID = primitiveAccelerationStructures[index].gpuResourceID
+                    descriptor.mask = 0xFF
+                    descriptor.options = []
+                    descriptor.transformationMatrix = packedFloat4x3(from: mesh.transform)
+                    return descriptor
+                }
+                instanceDescriptorBuffer.contents().copyMemory(from: &instanceDescriptors, byteCount: instanceDescriptors.count * MemoryLayout<MTLIndirectAccelerationStructureInstanceDescriptor>.stride)
+            }
+#if os(macOS)
+            instanceDescriptorBuffer.didModifyRange(0..<instanceDescriptorBuffer.length)
+#endif
+        }
+    }
+    func refitLegacyAccelerationStructures(computeEncoder: MTL4ComputeCommandEncoder) {
+        let allMeshes = scene.models.flatMap(\.meshes)
+        guard !allMeshes.isEmpty else { return }
+        guard let instanceDescriptorBuffer else { return }
+        
+        func makePrimitiveDescriptor(mesh: Mesh, vertexBuffer: MTLBuffer) -> MTLPrimitiveAccelerationStructureDescriptor {
+            let descriptors = mesh.submeshes.map { submesh -> MTLAccelerationStructureTriangleGeometryDescriptor in
+                let d = MTLAccelerationStructureTriangleGeometryDescriptor()
+                let vb = mesh.mtkMesh.vertexBuffers[0]
+                d.vertexBuffer = vertexBuffer
+                d.vertexBufferOffset = (vertexBuffer === vb.buffer) ? vb.offset : 0
+                d.vertexStride = MemoryLayout<SIMD3<Float>>.stride
+                let ib = submesh.mtkSubmesh.indexBuffer
+                d.indexBuffer = ib.buffer
+                d.indexBufferOffset = ib.offset
+                d.indexType = submesh.mtkSubmesh.indexType
+                d.triangleCount = submesh.mtkSubmesh.indexCount / 3
+                return d
+            }
+            
+            let primitiveDescriptor = MTLPrimitiveAccelerationStructureDescriptor()
+            primitiveDescriptor.geometryDescriptors = descriptors
+            return primitiveDescriptor
+        }
+        
+        let instanceDescriptor = MTLInstanceAccelerationStructureDescriptor()
+        instanceDescriptor.instanceCount = allMeshes.count
+        instanceDescriptor.instanceDescriptorType = .indirect
+        instanceDescriptor.instanceDescriptorBuffer = instanceDescriptorBuffer
+        
+        var requiredScratchSize = 0
+        for mesh in allMeshes where mesh.hasSkinning {
+            let primitiveDescriptor = makePrimitiveDescriptor(mesh: mesh, vertexBuffer: mesh.vertexBuffer)
+            let sizes = device.accelerationStructureSizes(descriptor: primitiveDescriptor)
+            requiredScratchSize = max(requiredScratchSize, max(sizes.refitScratchBufferSize, sizes.buildScratchBufferSize))
+        }
+        let instanceSizes = device.accelerationStructureSizes(descriptor: instanceDescriptor)
+        requiredScratchSize = max(requiredScratchSize, max(instanceSizes.refitScratchBufferSize, instanceSizes.buildScratchBufferSize))
+        
+        let scratchSize = max(requiredScratchSize, 1)
+        if scratchBuffer == nil || scratchBuffer!.length < scratchSize {
+            scratchBuffer = device.makeBuffer(length: scratchSize, options: .storageModePrivate)
+            scratchBuffer?.label = "AS Refit Scratch Buffer"
+        }
+        guard let scratchBuffer else { return }
+        
+        guard let commandBuffer = legacyCommandQueue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeAccelerationStructureCommandEncoder()
+        else { return }
+        encoder.label = "Legacy AS Refit"
+        
+        for (index, mesh) in allMeshes.enumerated() where mesh.hasSkinning {
+            let primitiveDescriptor = makePrimitiveDescriptor(mesh: mesh, vertexBuffer: mesh.vertexBuffer)
+            let sizes = device.accelerationStructureSizes(descriptor: primitiveDescriptor)
+            let canRefit = sizes.refitScratchBufferSize > 0
+            if canRefit {
+                encoder.refit(sourceAccelerationStructure: primitiveAccelerationStructures[index],
+                              descriptor: primitiveDescriptor,
+                              destinationAccelerationStructure: nil,
+                              scratchBuffer: scratchBuffer,
+                              scratchBufferOffset: 0)
+            } else {
+                encoder.build(accelerationStructure: primitiveAccelerationStructures[index],
+                              descriptor: primitiveDescriptor,
+                              scratchBuffer: scratchBuffer,
+                              scratchBufferOffset: 0)
+            }
+        }
+        
+        if let instancedAccelarationStructure {
+            let sizes = device.accelerationStructureSizes(descriptor: instanceDescriptor)
+            let canRefit = sizes.refitScratchBufferSize > 0
+            if canRefit {
+                encoder.refit(sourceAccelerationStructure: instancedAccelarationStructure,
+                              descriptor: instanceDescriptor,
+                              destinationAccelerationStructure: nil,
+                              scratchBuffer: scratchBuffer,
+                              scratchBufferOffset: 0)
+            } else {
+                encoder.build(accelerationStructure: instancedAccelarationStructure,
+                              descriptor: instanceDescriptor,
+                              scratchBuffer: scratchBuffer,
+                              scratchBufferOffset: 0)
+            }
+        }
+        
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+    }
+    func refitMTL4AccelerationStructures(computeEncoder: MTL4ComputeCommandEncoder) {
+        // --- AS Refit Pass ---
+        func bufferRange(_ buffer: MTLBuffer, offset: Int = 0, length: Int? = nil) -> MTL4BufferRange {
+            let rangeLength = length ?? (buffer.length - offset)
+            return MTL4BufferRange(bufferAddress: buffer.gpuAddress + UInt64(offset), length: UInt64(rangeLength))
+        }
+        
+        // Ensure the scratch buffer is large enough for refit.
+        let instanceRefitDescriptor: MTL4InstanceAccelerationStructureDescriptor? = {
+            guard let instanceDescriptorBuffer else { return nil }
+            let descriptor = MTL4InstanceAccelerationStructureDescriptor()
+            descriptor.instanceCount = scene.models.flatMap(\.meshes).count
+            descriptor.instanceDescriptorType = .indirect
+            descriptor.instanceDescriptorBuffer = MTL4BufferRange(bufferAddress: instanceDescriptorBuffer.gpuAddress,
+                                                                  length: UInt64(instanceDescriptorBuffer.length))
+            return descriptor
+        }()
+        
+        // Ensure the scratch buffer is large enough for refit.
+        var requiredRefitScratchSize = 0
+        var skinnedCursor = 0
+        for model in scene.models {
+            for mesh in model.meshes where mesh.hasSkinning {
+                let destPos = skinnedVertexBuffers[skinnedCursor]
+                let primitiveDescriptor = makePrimitiveDescriptor(mesh: mesh, vertexBuffer: destPos)
+                let sizes = device.accelerationStructureSizes(descriptor: primitiveDescriptor)
+                requiredRefitScratchSize = max(requiredRefitScratchSize, max(sizes.refitScratchBufferSize, sizes.buildScratchBufferSize))
+                skinnedCursor += 1
+            }
+        }
+        if let instanceRefitDescriptor {
+            let sizes = device.accelerationStructureSizes(descriptor: instanceRefitDescriptor)
+            requiredRefitScratchSize = max(requiredRefitScratchSize, max(sizes.refitScratchBufferSize, sizes.buildScratchBufferSize))
+        }
+        
+        if requiredRefitScratchSize > 0, (scratchBuffer == nil || scratchBuffer!.length < requiredRefitScratchSize) {
+            scratchBuffer = device.makeBuffer(length: requiredRefitScratchSize, options: .storageModePrivate)
+            scratchBuffer?.label = "AS Refit Scratch Buffer"
+            if let scratchBuffer, let residencySet = commandQueueResidencySet {
+                residencySet.addAllocations([scratchBuffer])
+                residencySet.commit()
+            } else {
+                rebuildResidencySet()
+            }
+        }
+        
+        // Use the same encoder for AS refit (no need for separate encoder)
+        var flatIndex = 0
+        skinnedCursor = 0
+        
+        for model in scene.models {
+            for mesh in model.meshes {
+                if mesh.hasSkinning {
+                    let destPos = skinnedVertexBuffers[skinnedCursor]
+                    let primitiveDescriptor = makePrimitiveDescriptor(mesh: mesh, vertexBuffer: destPos)
+                    let sizes = device.accelerationStructureSizes(descriptor: primitiveDescriptor)
+                    
+                    let canRefit = sizes.refitScratchBufferSize > 0
+                    let requiredScratchSize = canRefit ? sizes.refitScratchBufferSize : sizes.buildScratchBufferSize
+                    let scratchRange: MTL4BufferRange
+                    if requiredScratchSize == 0 {
+                        scratchRange = MTL4BufferRange(bufferAddress: 0, length: 0)
+                    } else if let scratchBuffer {
+                        scratchRange = bufferRange(scratchBuffer, length: requiredScratchSize)
+                    } else {
+                        // No scratch buffer available even though one is required; skip refit safely.
+                        flatIndex += 1
+                        skinnedCursor += 1
+                        continue
+                    }
+                    
+                    let asStructure = primitiveAccelerationStructures[flatIndex]
+                    if canRefit {
+                        computeEncoder.refit(sourceAccelerationStructure: asStructure,
+                                             descriptor: primitiveDescriptor,
+                                             destinationAccelerationStructure: nil,
+                                             scratchBuffer: scratchRange,
+                                             options: [])
+                    } else {
+                        // Rebuild when refit isn't supported.
+                        computeEncoder.build(destinationAccelerationStructure: asStructure,
+                                             descriptor: primitiveDescriptor,
+                                             scratchBuffer: scratchRange)
+                    }
+                    
+                    skinnedCursor += 1
+                }
+                flatIndex += 1
+            }
+        }
+        
+        // Refit TLAS as well so its bounds reflect the updated BLAS.
+        if let instanceRefitDescriptor, let instancedAccelarationStructure {
+            let sizes = device.accelerationStructureSizes(descriptor: instanceRefitDescriptor)
+            let canRefit = sizes.refitScratchBufferSize > 0
+            let requiredScratchSize = canRefit ? sizes.refitScratchBufferSize : sizes.buildScratchBufferSize
+            let scratchRange: MTL4BufferRange
+            if requiredScratchSize == 0 {
+                scratchRange = MTL4BufferRange(bufferAddress: 0, length: 0)
+            } else if let scratchBuffer {
+                scratchRange = bufferRange(scratchBuffer, length: requiredScratchSize)
+            } else {
+                scratchRange = MTL4BufferRange(bufferAddress: 0, length: 0)
+            }
+            
+            if canRefit {
+                computeEncoder.refit(sourceAccelerationStructure: instancedAccelarationStructure,
+                                     descriptor: instanceRefitDescriptor,
+                                     destinationAccelerationStructure: nil,
+                                     scratchBuffer: scratchRange,
+                                     options: [])
+            } else {
+                // Rebuild when refit isn't supported.
+                computeEncoder.build(destinationAccelerationStructure: instancedAccelarationStructure,
+                                     descriptor: instanceRefitDescriptor,
+                                     scratchBuffer: scratchRange)
+            }
+        }
+    }
+    
+    func updateSkinningAndBLAS(commandBuffer: MTL4CommandBuffer) {
+        if !updateSceneTimeAndAnimation() { return }
+        
+        updateInstanceDescriptors()
+        
+        // 2. Dispatch Skinning Kernel and Refit BLAS in one encoder for proper synchronization
+        let skinnedMeshes = scene.models.flatMap { $0.meshes }.filter { $0.hasSkinning }
+        // guard !skinnedMeshes.isEmpty else { return } // REMOVED GUARD
+
+        // Copy current skinned positions to previous buffers for motion vectors.
+        if !skinnedMeshes.isEmpty && !skinnedPrevVertexBuffers.isEmpty {
+            if let blitEncoder = commandBuffer.makeComputeCommandEncoder() {
+                blitEncoder.label = "Skinning Prev Copy"
+                let copyCount = min(skinnedVertexBuffers.count, skinnedPrevVertexBuffers.count)
+                for i in 0..<copyCount {
+                    blitEncoder.copy(sourceBuffer: skinnedVertexBuffers[i],
+                                     sourceOffset: 0,
+                                     destinationBuffer: skinnedPrevVertexBuffers[i],
+                                     destinationOffset: 0,
+                                     size: skinnedVertexBuffers[i].length)
+                }
+                blitEncoder.endEncoding()
+            }
+        }
+
+        guard let computeEncoder = commandBuffer.makeComputeCommandEncoder() else { return }
+        computeEncoder.label = "Skinning + AS Refit"
+        
+        // --- Skinning Pass (using shared helper) ---
+        if !skinnedMeshes.isEmpty {
+            dispatchSkinning(computeEncoder: computeEncoder)
+        }
+        
+        // Barrier to ensure skinning dispatch writes are visible to AS refit
+        // Using intra-pass barrier: wait for dispatch stage to complete before AS operations
+        
+        //        computeEncoder.barrier(afterEncoderStages: .dispatch,
+        //                               beforeEncoderStages: .accelerationStructure,
+        //                               visibilityOptions: .device)
+        
+        if canUseMTL4AccelerationStructures(device: device){
+            refitMTL4AccelerationStructures(computeEncoder: computeEncoder)
+        }else{
+            // TODO: BugFix
+            refitLegacyAccelerationStructures(computeEncoder: computeEncoder)
+        }
+        computeEncoder.endEncoding()
+    }
     @MainActor
     func orbit(deltaX: Float, deltaY: Float) {
+        if viewMode == .tps { return }
         let sensitivity: Float = 0.005
         cameraAzimuth += deltaX * sensitivity
         cameraElevation = clampElevation(cameraElevation + deltaY * sensitivity)
@@ -601,6 +1487,36 @@ class Renderer: NSObject {
     private func clampElevation(_ value: Float) -> Float {
         return max(-cameraElevationLimit, min(cameraElevationLimit, value))
     }
+    
+    private func makePrimitiveDescriptor(mesh: Mesh, vertexBuffer: MTLBuffer) -> MTL4PrimitiveAccelerationStructureDescriptor {
+        let descriptors = mesh.submeshes.map { submesh -> MTL4AccelerationStructureTriangleGeometryDescriptor in
+            let d = MTL4AccelerationStructureTriangleGeometryDescriptor()
+            d.vertexBuffer = MTL4BufferRange(bufferAddress: vertexBuffer.gpuAddress, length: UInt64(vertexBuffer.length))
+            d.vertexStride = MemoryLayout<SIMD3<Float>>.stride
+            d.vertexFormat = .float3
+            
+            let ib = submesh.mtkSubmesh.indexBuffer
+            d.indexBuffer = MTL4BufferRange(bufferAddress: ib.buffer.gpuAddress + UInt64(ib.offset), length: UInt64(ib.length))
+            d.indexType = submesh.mtkSubmesh.indexType
+            d.triangleCount = submesh.mtkSubmesh.indexCount / 3
+            return d
+        }
+        
+        let primitiveDescriptor = MTL4PrimitiveAccelerationStructureDescriptor()
+        primitiveDescriptor.geometryDescriptors = descriptors
+        return primitiveDescriptor
+    }
+    
+    // Convert a 4x4 transform matrix to MTLPackedFloat4x3 expected by instance descriptors
+    private func packedFloat4x3(from m: simd_float4x4) -> MTLPackedFloat4x3 {
+        var packed = MTLPackedFloat4x3()
+        // MTLPackedFloat4x3 stores 3 rows of 4 floats each (row-major packing)
+        packed.columns.0 = MTLPackedFloat3(m.columns.0.x, m.columns.0.y, m.columns.0.z)
+        packed.columns.1 = MTLPackedFloat3(m.columns.1.x, m.columns.1.y, m.columns.1.z)
+        packed.columns.2 = MTLPackedFloat3(m.columns.2.x, m.columns.2.y, m.columns.2.z)
+        packed.columns.3 = MTLPackedFloat3(m.columns.3.x, m.columns.3.y, m.columns.3.z)
+        return packed
+    }
 }
 
 extension Renderer: MTKViewDelegate {
@@ -636,6 +1552,12 @@ extension Renderer: MTKViewDelegate {
         
         let width = renderWidth
         let height = renderHeight
+        
+        // Update Skinning and BLAS
+        if canUseMTL4AccelerationStructures(device: device){
+            updateSkinningAndBLAS(commandBuffer: commandBuffer)
+        }
+            
         // process rays in 16x16 tiles for better GPU utilization
         let threadsPerGroup = MTLSize(width: 16, height: 16, depth: 1)
         let threadGroups = MTLSize(
@@ -651,7 +1573,8 @@ extension Renderer: MTKViewDelegate {
         let uniformAddress = uniformBuffer.gpuAddress + UInt64(uniformBufferOffset)
         computeTable.setAddress(uniformAddress, index: BufferIndex.uniforms.rawValue)
         computeTable.setAddress(resourcesBuffer.gpuAddress, index: BufferIndex.resources.rawValue)
-        computeTable.setAddress(instanceDescriptorBuffer.gpuAddress, index: BufferIndex.instanceDescriptors.rawValue)
+        computeTable.setAddress(instanceDescriptorBuffer!.gpuAddress, index: BufferIndex.instanceDescriptors.rawValue)
+        computeTable.setAddress(previousInstanceDescriptorBuffer!.gpuAddress, index: BufferIndex.previousInstanceDescriptors.rawValue)
         computeTable.setAddress(scene.lightBuffer.gpuAddress, index: BufferIndex.lights.rawValue)
         computeTable.setResource(instancedAccelarationStructure.gpuResourceID, bufferIndex: BufferIndex.accelerationStructure.rawValue)
         
@@ -665,6 +1588,18 @@ extension Renderer: MTKViewDelegate {
         if let motionTexture = motionTexture {
             computeTable.setTexture(motionTexture.gpuResourceID, index: TextureIndex.motion.rawValue)
         }
+        if let diffuseAlbedoTexture = diffuseAlbedoTexture {
+            computeTable.setTexture(diffuseAlbedoTexture.gpuResourceID, index: TextureIndex.diffuseAlbedo.rawValue)
+        }
+        if let specularAlbedoTexture = specularAlbedoTexture {
+            computeTable.setTexture(specularAlbedoTexture.gpuResourceID, index: TextureIndex.specularAlbedo.rawValue)
+        }
+        if let normalTexture = normalTexture {
+            computeTable.setTexture(normalTexture.gpuResourceID, index: TextureIndex.normal.rawValue)
+        }
+        if let roughnessTexture = roughnessTexture {
+            computeTable.setTexture(roughnessTexture.gpuResourceID, index: TextureIndex.roughness.rawValue)
+        }
         
         computeEncoder.setArgumentTable(computeTable)
         computeEncoder.dispatchThreadgroups(threadgroupsPerGrid: threadGroups, threadsPerThreadgroup: threadsPerGroup)
@@ -673,12 +1608,12 @@ extension Renderer: MTKViewDelegate {
         let tmp = accumulationTargets[0]
         accumulationTargets[0] = accumulationTargets[1]
         accumulationTargets[1] = tmp
-
+        
         if let residencySet = commandQueueResidencySet {
             commandBuffer.useResidencySet(residencySet)
         }
         
-        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, drawable: drawable, commandBuffer: commandBuffer)
+        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable, commandBuffer: commandBuffer)
         
         gpuFrameIndex += 1
     }
@@ -700,17 +1635,16 @@ class LecacyUpScaleRenderer {
     
     var legacySpatialScaler: MTLFXSpatialScaler?
     var temporalScaler: MTLFXTemporalScaler?
+    @available(macOS 26.0, iOS 18.0, *)
+    var temporalDenoisedScaler: MTLFXTemporalDenoisedScaler?
     var upscaledTexture: MTLTexture?
     var useTemporalScaler: Bool = false
+    var useTemporalDenoiser: Bool = false
     var isMetalFXEnabled: Bool = true
     
-    init?(device: MTLDevice, library: MTLLibrary, endFrameEvent: MTLSharedEvent) {
+    init?(device: MTLDevice, library: MTLLibrary, commandQueue: MTLCommandQueue ,endFrameEvent: MTLSharedEvent) {
         self.device = device
         self.endFrameEvent = endFrameEvent
-        
-        guard let commandQueue = device.makeCommandQueue() else {
-            return nil
-        }
         self.legacyCommandQueue = commandQueue
         
         let legacyDescriptor = MTLRenderPipelineDescriptor()
@@ -763,6 +1697,32 @@ class LecacyUpScaleRenderer {
         descriptor.isInputContentPropertiesEnabled = false
         return descriptor.makeTemporalScaler(device: device)
     }
+
+    private func makeTemporalDenoisedScaler(inputWidth: Int,
+                                            inputHeight: Int,
+                                            outputWidth: Int,
+                                            outputHeight: Int,
+                                            colorFormat: MTLPixelFormat) -> MTLFXTemporalDenoisedScaler? {
+        if #available(macOS 26.0, iOS 18.0, *) {
+            guard MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device) else { return nil }
+            let descriptor = MTLFXTemporalDenoisedScalerDescriptor()
+            descriptor.colorTextureFormat = colorFormat
+            descriptor.depthTextureFormat = .r32Float
+            descriptor.motionTextureFormat = .rg16Float
+            descriptor.diffuseAlbedoTextureFormat = .rgba16Float
+            descriptor.specularAlbedoTextureFormat = .rgba16Float
+            descriptor.normalTextureFormat = .rgba16Float
+            descriptor.roughnessTextureFormat = .r16Float
+            descriptor.outputTextureFormat = colorFormat
+            descriptor.inputWidth = inputWidth
+            descriptor.inputHeight = inputHeight
+            descriptor.outputWidth = outputWidth
+            descriptor.outputHeight = outputHeight
+            descriptor.isAutoExposureEnabled = false
+            return descriptor.makeTemporalDenoisedScaler(device: device)
+        }
+        return nil
+    }
     
     func createTextures(outputSize: CGSize, colorFormat: MTLPixelFormat, renderSize: CGSize, accumulationTargets: [MTLTexture]) {
         let outputWidth = Int(outputSize.width)
@@ -774,40 +1734,49 @@ class LecacyUpScaleRenderer {
             return
         }
         
-        let wantsUpscale = (inputWidth != outputWidth || inputHeight != outputHeight) && isMetalFXEnabled
+        let wantsScaler = isMetalFXEnabled && (useTemporalDenoiser || inputWidth != outputWidth || inputHeight != outputHeight)
         var spatialScaler: MTLFXSpatialScaler?
         var tempScaler: MTLFXTemporalScaler?
+        var tempDenoiser: MTLFXTemporalDenoisedScaler?
         let finalColorFormat = colorFormat  // Use the provided colorFormat directly
         
-        if wantsUpscale {
-            // Try temporal scaler first if enabled
-            if useTemporalScaler {
-                tempScaler = makeTemporalScaler(inputWidth: inputWidth,
-                                               inputHeight: inputHeight,
-                                               outputWidth: outputWidth,
-                                               outputHeight: outputHeight,
-                                               colorFormat: finalColorFormat)
+        if wantsScaler {
+            if useTemporalDenoiser {
+                tempDenoiser = makeTemporalDenoisedScaler(inputWidth: inputWidth,
+                                                          inputHeight: inputHeight,
+                                                          outputWidth: outputWidth,
+                                                          outputHeight: outputHeight,
+                                                          colorFormat: finalColorFormat)
             }
-            
-            // Fallback to spatial scaler if temporal is not available
-            if tempScaler == nil {
+            if tempDenoiser == nil && useTemporalScaler {
+                tempScaler = makeTemporalScaler(inputWidth: inputWidth,
+                                                inputHeight: inputHeight,
+                                                outputWidth: outputWidth,
+                                                outputHeight: outputHeight,
+                                                colorFormat: finalColorFormat)
+            }
+            if tempDenoiser == nil && tempScaler == nil {
                 spatialScaler = makeLegacySpatialScaler(inputWidth: inputWidth,
-                                                 inputHeight: inputHeight,
-                                                 outputWidth: outputWidth,
-                                                 outputHeight: outputHeight,
-                                                 colorFormat: finalColorFormat)
+                                                        inputHeight: inputHeight,
+                                                        outputWidth: outputWidth,
+                                                        outputHeight: outputHeight,
+                                                        colorFormat: finalColorFormat)
             }
         }
         
         legacySpatialScaler = spatialScaler
         temporalScaler = tempScaler
+        temporalDenoisedScaler = tempDenoiser
         
-        if wantsUpscale && (spatialScaler != nil || tempScaler != nil) {
+        if wantsScaler && (spatialScaler != nil || tempScaler != nil || tempDenoiser != nil) {
             var outputUsage: MTLTextureUsage = [.shaderRead]
             if let scaler = legacySpatialScaler {
                 outputUsage.formUnion(scaler.outputTextureUsage)
             }
             if let scaler = temporalScaler {
+                outputUsage.formUnion(scaler.outputTextureUsage)
+            }
+            if let scaler = temporalDenoisedScaler {
                 outputUsage.formUnion(scaler.outputTextureUsage)
             }
             
@@ -825,13 +1794,33 @@ class LecacyUpScaleRenderer {
         }
     }
     
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, drawable: CAMetalDrawable) {
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable) {
         guard let legacyCommandBuffer = legacyCommandQueue.makeCommandBuffer() else {
             return
         }
         legacyCommandBuffer.encodeWaitForEvent(computeEvent, value: gpuFrameIndex)
-
-        if let temporalScaler = temporalScaler,
+        
+        if let temporalDenoisedScaler = temporalDenoisedScaler,
+           let upscaledTexture = upscaledTexture,
+           let depthTexture = depthTexture,
+           let motionTexture = motionTexture,
+           let diffuseAlbedoTexture = diffuseAlbedoTexture,
+           let specularAlbedoTexture = specularAlbedoTexture,
+           let normalTexture = normalTexture,
+           let roughnessTexture = roughnessTexture,
+           !accumulationTargets.isEmpty {
+            temporalDenoisedScaler.colorTexture = accumulationTargets[0]
+            temporalDenoisedScaler.depthTexture = depthTexture
+            temporalDenoisedScaler.motionTexture = motionTexture
+            temporalDenoisedScaler.diffuseAlbedoTexture = diffuseAlbedoTexture
+            temporalDenoisedScaler.specularAlbedoTexture = specularAlbedoTexture
+            temporalDenoisedScaler.normalTexture = normalTexture
+            temporalDenoisedScaler.roughnessTexture = roughnessTexture
+            temporalDenoisedScaler.outputTexture = upscaledTexture
+//            temporalDenoisedScaler.inputContentWidth = accumulationTargets[0].width
+//            temporalDenoisedScaler.inputContentHeight = accumulationTargets[0].height
+            temporalDenoisedScaler.encode(commandBuffer: legacyCommandBuffer)
+        } else if let temporalScaler = temporalScaler,
            let upscaledTexture = upscaledTexture,
            let depthTexture = depthTexture,
            let motionTexture = motionTexture,
@@ -852,7 +1841,7 @@ class LecacyUpScaleRenderer {
             legacySpatialScaler.outputTexture = upscaledTexture
             legacySpatialScaler.encode(commandBuffer: legacyCommandBuffer)
         }
-
+        
         guard let renderPassDescriptor = view.currentRenderPassDescriptor else { return }
         guard let renderEncoder = legacyCommandBuffer.makeRenderCommandEncoder(descriptor: renderPassDescriptor) else {
             return
@@ -866,7 +1855,7 @@ class LecacyUpScaleRenderer {
             renderEncoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 6)
         }
         renderEncoder.endEncoding()
-
+        
         legacyCommandBuffer.present(drawable)
         legacyCommandBuffer.encodeSignalEvent(endFrameEvent, value: gpuFrameIndex)
         legacyCommandBuffer.commit()
@@ -889,8 +1878,11 @@ class MTL4UpScaleRenderer {
     
     var spatialScaler: MTL4FXSpatialScaler?
     var temporalScaler: MTL4FXTemporalScaler?
+    @available(macOS 26.0, iOS 18.0, *)
+    var temporalDenoisedScaler: MTL4FXTemporalDenoisedScaler?
     var upscaledTexture: MTLTexture?
     var useTemporalScaler: Bool = false
+    var useTemporalDenoiser: Bool = false
     var isMetalFXEnabled: Bool = true
     let metal4Compiler: MTL4Compiler
     init?(device: MTLDevice, library: MTLLibrary, endFrameEvent: MTLSharedEvent, commandQueue: MTL4CommandQueue, metal4Compiler: MTL4Compiler) {
@@ -932,10 +1924,10 @@ class MTL4UpScaleRenderer {
     }
     
     private func makeSpatialScaler(inputWidth: Int,
-                                         inputHeight: Int,
-                                         outputWidth: Int,
-                                         outputHeight: Int,
-                                         colorFormat: MTLPixelFormat) -> MTL4FXSpatialScaler? {
+                                   inputHeight: Int,
+                                   outputWidth: Int,
+                                   outputHeight: Int,
+                                   colorFormat: MTLPixelFormat) -> MTL4FXSpatialScaler? {
         guard MTLFXSpatialScalerDescriptor.supportsDevice(device) else { return nil }
         let descriptor = MTLFXSpatialScalerDescriptor()
         descriptor.colorTextureFormat = colorFormat
@@ -967,6 +1959,32 @@ class MTL4UpScaleRenderer {
         descriptor.isInputContentPropertiesEnabled = false
         return descriptor.makeTemporalScaler(device: device, compiler: metal4Compiler)
     }
+
+    private func makeTemporalDenoisedScaler(inputWidth: Int,
+                                            inputHeight: Int,
+                                            outputWidth: Int,
+                                            outputHeight: Int,
+                                            colorFormat: MTLPixelFormat) -> MTL4FXTemporalDenoisedScaler? {
+        if #available(macOS 26.0, iOS 18.0, *) {
+            guard MTLFXTemporalDenoisedScalerDescriptor.supportsDevice(device) else { return nil }
+            let descriptor = MTLFXTemporalDenoisedScalerDescriptor()
+            descriptor.colorTextureFormat = colorFormat
+            descriptor.depthTextureFormat = .r32Float
+            descriptor.motionTextureFormat = .rg16Float
+            descriptor.diffuseAlbedoTextureFormat = .rgba16Float
+            descriptor.specularAlbedoTextureFormat = .rgba16Float
+            descriptor.normalTextureFormat = .rgba16Float
+            descriptor.roughnessTextureFormat = .r16Float
+            descriptor.outputTextureFormat = colorFormat
+            descriptor.inputWidth = inputWidth
+            descriptor.inputHeight = inputHeight
+            descriptor.outputWidth = outputWidth
+            descriptor.outputHeight = outputHeight
+            descriptor.isAutoExposureEnabled = false
+            return descriptor.makeTemporalDenoisedScaler(device: device, compiler: metal4Compiler)
+        }
+        return nil
+    }
     
     func createTextures(outputSize: CGSize, colorFormat: MTLPixelFormat, renderSize: CGSize, accumulationTargets: [MTLTexture]) {
         let outputWidth = Int(outputSize.width)
@@ -978,40 +1996,49 @@ class MTL4UpScaleRenderer {
             return
         }
         
-        let wantsUpscale = (inputWidth != outputWidth || inputHeight != outputHeight) && isMetalFXEnabled
+        let wantsScaler = isMetalFXEnabled && (useTemporalDenoiser || inputWidth != outputWidth || inputHeight != outputHeight)
         var spaScaler: MTL4FXSpatialScaler?
         var tempScaler: MTL4FXTemporalScaler?
+        var tempDenoiser: MTL4FXTemporalDenoisedScaler?
         let finalColorFormat = colorFormat  // Use the provided colorFormat directly
         
-        if wantsUpscale {
-            // Try temporal scaler first if enabled
-            if useTemporalScaler {
+        if wantsScaler {
+            if useTemporalDenoiser {
+                tempDenoiser = makeTemporalDenoisedScaler(inputWidth: inputWidth,
+                                                          inputHeight: inputHeight,
+                                                          outputWidth: outputWidth,
+                                                          outputHeight: outputHeight,
+                                                          colorFormat: finalColorFormat)
+            }
+            if tempDenoiser == nil && useTemporalScaler {
                 tempScaler = makeTemporalScaler(inputWidth: inputWidth,
-                                               inputHeight: inputHeight,
-                                               outputWidth: outputWidth,
-                                               outputHeight: outputHeight,
+                                                inputHeight: inputHeight,
+                                                outputWidth: outputWidth,
+                                                outputHeight: outputHeight,
                                                 colorFormat: finalColorFormat)
             }
-            
-            // Fallback to spatial scaler if temporal is not available
-            if tempScaler == nil {
+            if tempDenoiser == nil && tempScaler == nil {
                 spaScaler = makeSpatialScaler(inputWidth: inputWidth,
-                                                 inputHeight: inputHeight,
-                                                 outputWidth: outputWidth,
-                                                 outputHeight: outputHeight,
-                                                 colorFormat: finalColorFormat)
+                                              inputHeight: inputHeight,
+                                              outputWidth: outputWidth,
+                                              outputHeight: outputHeight,
+                                              colorFormat: finalColorFormat)
             }
         }
         
         spatialScaler = spaScaler
         temporalScaler = tempScaler
+        temporalDenoisedScaler = tempDenoiser
         
-        if wantsUpscale && (spatialScaler != nil || tempScaler != nil) {
-            var outputUsage: MTLTextureUsage = [.shaderRead,.renderTarget,.shaderWrite]
+        if wantsScaler && (spatialScaler != nil || tempScaler != nil || tempDenoiser != nil) {
+            var outputUsage: MTLTextureUsage = [.shaderRead]
             if let scaler = spatialScaler {
                 outputUsage.formUnion(scaler.outputTextureUsage)
             }
             if let scaler = temporalScaler {
+                outputUsage.formUnion(scaler.outputTextureUsage)
+            }
+            if let scaler = temporalDenoisedScaler {
                 outputUsage.formUnion(scaler.outputTextureUsage)
             }
             
@@ -1029,7 +2056,7 @@ class MTL4UpScaleRenderer {
         }
     }
     
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer passedCommandBuffer: MTL4CommandBuffer? = nil) {
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer passedCommandBuffer: MTL4CommandBuffer? = nil) {
         let commandBuffer: MTL4CommandBuffer
         if let passedCommandBuffer {
             commandBuffer = passedCommandBuffer
@@ -1039,8 +2066,28 @@ class MTL4UpScaleRenderer {
             self.commandBuffer.beginCommandBuffer(allocator: commandAllocator)
             commandBuffer = self.commandBuffer
         }
-
-        if let temporalScaler = temporalScaler,
+        
+        if let temporalDenoisedScaler = temporalDenoisedScaler,
+           let upscaledTexture = upscaledTexture,
+           let depthTexture = depthTexture,
+           let motionTexture = motionTexture,
+           let diffuseAlbedoTexture = diffuseAlbedoTexture,
+           let specularAlbedoTexture = specularAlbedoTexture,
+           let normalTexture = normalTexture,
+           let roughnessTexture = roughnessTexture,
+           !accumulationTargets.isEmpty {
+            temporalDenoisedScaler.colorTexture = accumulationTargets[0]
+            temporalDenoisedScaler.depthTexture = depthTexture
+            temporalDenoisedScaler.motionTexture = motionTexture
+            temporalDenoisedScaler.diffuseAlbedoTexture = diffuseAlbedoTexture
+            temporalDenoisedScaler.specularAlbedoTexture = specularAlbedoTexture
+            temporalDenoisedScaler.normalTexture = normalTexture
+            temporalDenoisedScaler.roughnessTexture = roughnessTexture
+            temporalDenoisedScaler.outputTexture = upscaledTexture
+            // need fence otherwise "failed assertion `_outputTextureBarrierStages not set" raised
+            temporalDenoisedScaler.fence = device.makeFence()
+            temporalDenoisedScaler.encode(commandBuffer: commandBuffer)
+        } else if let temporalScaler = temporalScaler,
            let upscaledTexture = upscaledTexture,
            let depthTexture = depthTexture,
            let motionTexture = motionTexture,
@@ -1051,6 +2098,7 @@ class MTL4UpScaleRenderer {
             temporalScaler.outputTexture = upscaledTexture
             temporalScaler.inputContentWidth = accumulationTargets[0].width
             temporalScaler.inputContentHeight = accumulationTargets[0].height
+            // need fence otherwise "failed assertion `_outputTextureBarrierStages not set" raised
             temporalScaler.fence = device.makeFence()
             temporalScaler.encode(commandBuffer: commandBuffer)
         } else if let spatialScaler = spatialScaler,
@@ -1060,10 +2108,11 @@ class MTL4UpScaleRenderer {
             spatialScaler.inputContentWidth = accumulationTargets[0].width
             spatialScaler.inputContentHeight = accumulationTargets[0].height
             spatialScaler.outputTexture = upscaledTexture
+            // need fence otherwise "failed assertion `_outputTextureBarrierStages not set" raised
             spatialScaler.fence = device.makeFence()
             spatialScaler.encode(commandBuffer: commandBuffer)
         }
-
+        
         guard let renderPassDescriptor = view.currentMTL4RenderPassDescriptor else {
             commandBuffer.endCommandBuffer()
             commandQueue.commit([commandBuffer])
@@ -1086,7 +2135,7 @@ class MTL4UpScaleRenderer {
             renderEncoder.drawPrimitives(primitiveType: .triangle, vertexStart: 0, vertexCount: 6)
         }
         renderEncoder.endEncoding()
-
+        
         commandBuffer.endCommandBuffer()
         commandQueue.waitForDrawable(drawable)
         commandQueue.commit([commandBuffer])
@@ -1102,6 +2151,7 @@ class MTL4UpScaleRenderer {
 
 protocol FramePresenter {
     var useTemporalScaler: Bool { get set }
+    var useTemporalDenoiser: Bool { get set }
     var isMetalFXEnabled: Bool { get set }
     
     func createTextures(outputSize: CGSize, colorFormat: MTLPixelFormat, renderSize: CGSize, accumulationTargets: [MTLTexture])
@@ -1112,6 +2162,10 @@ protocol FramePresenter {
               accumulationTargets: [MTLTexture],
               depthTexture: MTLTexture?,
               motionTexture: MTLTexture?,
+              diffuseAlbedoTexture: MTLTexture?,
+              specularAlbedoTexture: MTLTexture?,
+              normalTexture: MTLTexture?,
+              roughnessTexture: MTLTexture?,
               drawable: CAMetalDrawable,
               commandBuffer: MTL4CommandBuffer)
 }
@@ -1123,6 +2177,11 @@ class LegacyFramePresenter: FramePresenter {
     var useTemporalScaler: Bool {
         get { renderer.useTemporalScaler }
         set { renderer.useTemporalScaler = newValue }
+    }
+    
+    var useTemporalDenoiser: Bool {
+        get { renderer.useTemporalDenoiser }
+        set { renderer.useTemporalDenoiser = newValue }
     }
     
     var isMetalFXEnabled: Bool {
@@ -1145,6 +2204,10 @@ class LegacyFramePresenter: FramePresenter {
               accumulationTargets: [MTLTexture],
               depthTexture: MTLTexture?,
               motionTexture: MTLTexture?,
+              diffuseAlbedoTexture: MTLTexture?,
+              specularAlbedoTexture: MTLTexture?,
+              normalTexture: MTLTexture?,
+              roughnessTexture: MTLTexture?,
               drawable: CAMetalDrawable,
               commandBuffer: MTL4CommandBuffer) {
         
@@ -1153,12 +2216,12 @@ class LegacyFramePresenter: FramePresenter {
         commandQueue.commit([commandBuffer])
         commandQueue.signalEvent(computeEvent, value: gpuFrameIndex)
         
-        renderer.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, drawable: drawable)
+        renderer.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable)
     }
 }
 
-extension MTL4UpScaleRenderer: FramePresenter {    
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer: MTL4CommandBuffer) {
-        self.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, drawable: drawable, commandBuffer: commandBuffer as MTL4CommandBuffer?)
+extension MTL4UpScaleRenderer: FramePresenter {
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer: MTL4CommandBuffer) {
+        self.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable, commandBuffer: commandBuffer as MTL4CommandBuffer?)
     }
 }

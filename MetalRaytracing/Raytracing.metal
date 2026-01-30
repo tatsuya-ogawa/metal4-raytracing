@@ -147,12 +147,75 @@ inline float3 alignHemisphereWithNormal(float3 sample, float3 normal) {
     return sample.x * right + sample.y * up + sample.z * forward;
 }
 
+inline float distributionGGX(float NdotH, float alpha) {
+    float a2 = alpha * alpha;
+    float denom = (NdotH * NdotH) * (a2 - 1.0f) + 1.0f;
+    return a2 / max(M_PI_F * denom * denom, 1e-7f);
+}
+
+inline float geometrySchlickGGX(float NdotV, float k) {
+    return NdotV / max(NdotV * (1.0f - k) + k, 1e-7f);
+}
+
+inline float geometrySmith(float NdotV, float NdotL, float k) {
+    return geometrySchlickGGX(NdotV, k) * geometrySchlickGGX(NdotL, k);
+}
+
+inline float3 fresnelSchlick(float cosTheta, float3 F0) {
+    return F0 + (1.0f - F0) * pow(clamp(1.0f - cosTheta, 0.0f, 1.0f), 5.0f);
+}
+
 struct Resource
 {
-    device float3 *normals;
-    device int *indices;
-    device Material *material;
+    device float3 *positions [[id(0)]];
+    device float3 *previousPositions [[id(1)]];
+    device float3 *normals [[id(2)]];
+    device int *indices [[id(3)]];
+    device Material *material [[id(4)]];
+    device float2 *uvs [[id(5)]];
+    texture2d<float> baseColorMap [[id(6)]];
+    texture2d<float> normalMap [[id(7)]];
+    texture2d<float> roughnessMap [[id(8)]];
+    texture2d<float> metallicMap [[id(9)]];
+    texture2d<float> aoMap [[id(10)]];
+    texture2d<float> opacityMap [[id(11)]];
+    texture2d<float> emissionMap [[id(12)]];
 };
+
+inline bool computeTangentBasis(device float3 *positions,
+                                device float2 *uvs,
+                                intersector<triangle_data, instancing>::result_type intersection,
+                                device int *vertexIndices,
+                                thread float3 &tangent,
+                                thread float3 &bitangent)
+{
+    unsigned int triangleIndex = intersection.primitive_id;
+    unsigned int index1 = vertexIndices[triangleIndex * 3 + 1];
+    unsigned int index2 = vertexIndices[triangleIndex * 3 + 2];
+    unsigned int index3 = vertexIndices[triangleIndex * 3 + 0];
+    
+    float3 p0 = positions[index1];
+    float3 p1 = positions[index2];
+    float3 p2 = positions[index3];
+    
+    float2 uv0 = uvs[index1];
+    float2 uv1 = uvs[index2];
+    float2 uv2 = uvs[index3];
+    
+    float3 e1 = p1 - p0;
+    float3 e2 = p2 - p0;
+    float2 dUV1 = uv1 - uv0;
+    float2 dUV2 = uv2 - uv0;
+    
+    float denom = dUV1.x * dUV2.y - dUV1.y * dUV2.x;
+    if (fabs(denom) < 1e-8f) {
+        return false;
+    }
+    float r = 1.0f / denom;
+    tangent = (e1 * dUV2.y - e2 * dUV1.y) * r;
+    bitangent = (e2 * dUV1.x - e1 * dUV2.x) * r;
+    return (length(tangent) > 1e-8f) && (length(bitangent) > 1e-8f);
+}
 
 [[max_total_threads_per_threadgroup(256)]]
 kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
@@ -160,12 +223,17 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                              acceleration_structure<instancing> accelerationStructure [[ buffer(BufferIndexAccelerationStructure) ]],
                              device Resource *resources [[ buffer(BufferIndexResources) ]],
                              device MTLIndirectAccelerationStructureInstanceDescriptor *instances [[ buffer(BufferIndexInstanceDescriptors) ]],
+                             device MTLIndirectAccelerationStructureInstanceDescriptor *prevInstances [[ buffer(BufferIndexPreviousInstanceDescriptors) ]],
                              device Light *lights [[ buffer(BufferIndexLights) ]],
                              texture2d<unsigned int, access::read> randomTexture [[ texture(TextureIndexRandom) ]],
                              texture2d<float, access::read> prevTex [[ texture(TextureIndexAccumulation) ]],
                              texture2d<float, access::write> dstTex [[ texture(TextureIndexPreviousAccumulation) ]],
                              texture2d<float, access::write> depthTex [[ texture(TextureIndexDepth) ]],
-                             texture2d<float, access::write> motionTex [[ texture(TextureIndexMotion) ]])
+                             texture2d<float, access::read_write> motionTex [[ texture(TextureIndexMotion) ]],
+                             texture2d<float, access::write> diffuseAlbedoTex [[ texture(TextureIndexDiffuseAlbedo) ]],
+                             texture2d<float, access::write> specularAlbedoTex [[ texture(TextureIndexSpecularAlbedo) ]],
+                             texture2d<float, access::write> normalTex [[ texture(TextureIndexNormal) ]],
+                             texture2d<float, access::write> roughnessTex [[ texture(TextureIndexRoughness) ]])
 {
     // The sample aligns the thread count to the threadgroup size. which means the thread count
     // may be different than the bounds of the texture. Test to make sure this thread
@@ -177,10 +245,18 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         unsigned int offset = randomTexture.read(tid).x;
         
         float3 totalColor = float3(0.0f);
+        float2 prevMotion = motionTex.read(tid).xy;
         
         // For temporal scaler: track first hit for depth and motion
         float primaryDepth = 0.0f;
         float2 motionVector = float2(0.0f);
+        bool hadPrimaryHit = false;
+        
+        float4 outDiffuseAlbedo = float4(0.0f);
+        float4 outSpecularAlbedo = float4(0.0f);
+        float4 outNormal = float4(0.0f);
+        float4 outRoughness = float4(0.0f);
+        bool wroteGBuffer = false;
         
         // Multiple samples per pixel
         for (int sampleIndex = 0; sampleIndex < uniforms.samplesPerPixel; sampleIndex++) {
@@ -189,11 +265,11 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             // Add a random offset to the pixel coordinates for antialiasing.
             float2 r = float2(halton(offset + frameOffset, 0),
                               halton(offset + frameOffset, 1));
-        pixel += r;
+            float2 samplePixel = (float2)tid + r;
         
-        // Map pixel coordinates to -1..1.
-        float2 uv = (float2)pixel / float2(uniforms.width, uniforms.height);
-        uv = uv * 2.0 - 1.0;
+            // Map pixel coordinates to -1..1.
+            float2 uv = samplePixel / float2(uniforms.width, uniforms.height);
+            uv = uv * 2.0 - 1.0;
         
         constant Camera & camera = uniforms.camera;
         
@@ -222,7 +298,10 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         
         typename intersector<triangle_data, instancing>::result_type intersection;
                 
-        for (int bounce = 0; bounce < uniforms.maxBounces; bounce++) {
+        int bounce = 0;
+        int step = 0;
+        int transparencyPasses = 0;
+        while (bounce < uniforms.maxBounces) {
             // Get the closest intersection, not the first intersection. This is the default, but
             // the sample adjusts this property below when it casts shadow rays.
             i.accept_any_intersection(false);
@@ -230,36 +309,6 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             // Check for intersection between the ray and the acceleration structure.
             //intersection = i.intersect(ray, accelerationStructure, bounce == 0 ? RAY_MASK_PRIMARY : RAY_MASK_SECONDARY);
             intersection = i.intersect(ray, accelerationStructure);
-            
-            // Store depth and motion for first bounce (primary ray)
-            if (bounce == 0 && sampleIndex == 0 && intersection.type != intersection_type::none) {
-                // Depth from camera
-                primaryDepth = intersection.distance;
-                
-                // Compute motion vector (current position - previous frame position)
-                float3 worldPos = ray.origin + ray.direction * intersection.distance;
-                
-                // Project current position
-                constant Camera & camera = uniforms.camera;
-                float3 viewPos = worldPos - camera.position;
-                float2 screenPos;
-                screenPos.x = dot(viewPos, camera.right);
-                screenPos.y = dot(viewPos, camera.up);
-                float depth = dot(viewPos, camera.forward);
-                screenPos /= max(depth, 0.001f);
-                
-                // Project previous position
-                constant Camera & prevCamera = uniforms.previousCamera;
-                float3 prevViewPos = worldPos - prevCamera.position;
-                float2 prevScreenPos;
-                prevScreenPos.x = dot(prevViewPos, prevCamera.right);
-                prevScreenPos.y = dot(prevViewPos, prevCamera.up);
-                float prevDepth = dot(prevViewPos, prevCamera.forward);
-                prevScreenPos /= max(prevDepth, 0.001f);
-                
-                // Motion vector in screen space
-                motionVector = screenPos - prevScreenPos;
-            }
             
             // Stop if the ray didn't hit anything and has bounced out of the scene.
             if (intersection.type == intersection_type::none)
@@ -282,13 +331,253 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             int resourceIndex = instanceIndex * maxSubmeshes2 + geometryIndex2;
             Resource resource = resources[resourceIndex];
             
+            // Store depth and motion for first bounce (primary ray)
+            if (bounce == 0 && sampleIndex == 0) {
+                // Depth from camera
+                primaryDepth = intersection.distance;
+                
+                // Compute object-space position and previous object-space position
+                float3 objectSpacePos = interpolateVertexAttribute(resource.positions, intersection, resource.indices);
+                float3 prevObjectSpacePos = interpolateVertexAttribute(resource.previousPositions, intersection, resource.indices);
+                
+                // Current world position
+                float3 worldPos = (objectToWorldSpaceTransform * float4(objectSpacePos, 1.0)).xyz;
+                
+                // Previous world position (previous instance transform + previous skinned pos)
+                float4x4 prevObjectToWorldSpaceTransform(1.0f);
+                for (int column = 0; column < 4; column++) {
+                    for (int row = 0; row < 3; row++) {
+                        prevObjectToWorldSpaceTransform[column][row] = prevInstances[instanceIndex].transformationMatrix[column][row];
+                    }
+                }
+                float3 prevWorldPos = (prevObjectToWorldSpaceTransform * float4(prevObjectSpacePos, 1.0)).xyz;
+                
+                // Project current position
+                constant Camera & camera = uniforms.camera;
+                float3 viewPos = worldPos - camera.position;
+                float2 screenPos;
+                screenPos.x = dot(viewPos, camera.right);
+                screenPos.y = dot(viewPos, camera.up);
+                float depth = dot(viewPos, camera.forward);
+                screenPos /= max(depth, 0.001f);
+                
+                // Project previous position
+                constant Camera & prevCamera = uniforms.previousCamera;
+                float3 prevViewPos = prevWorldPos - prevCamera.position;
+                float2 prevScreenPos;
+                prevScreenPos.x = dot(prevViewPos, prevCamera.right);
+                prevScreenPos.y = dot(prevViewPos, prevCamera.up);
+                float prevDepth = dot(prevViewPos, prevCamera.forward);
+                prevScreenPos /= max(prevDepth, 0.001f);
+                
+                // Motion vector in screen space
+                motionVector = screenPos - prevScreenPos;
+                hadPrimaryHit = true;
+            }
+            
             float3 objectSpaceSurfaceNormal = interpolateVertexAttribute(resource.normals, intersection, resource.indices);
             float3 worldSpaceSurfaceNormal = (objectToWorldSpaceTransform * float4(objectSpaceSurfaceNormal, 0)).xyz;
             worldSpaceSurfaceNormal = normalize(worldSpaceSurfaceNormal);
-            float3 surfaceColor = resource.material->baseColor;
+            // for invalid normal model
+            if (length(objectSpaceSurfaceNormal) < 1e-10f) {
+                worldSpaceSurfaceNormal = -ray.direction;
+            }
+            
+            float3 albedo = resource.material->baseColor;
+            uint textureFlags = resource.material->textureFlags;
+            bool hasBaseColorMap = (textureFlags & MATERIAL_TEXTURE_BASECOLOR) != 0;
+            bool hasNormalMap = (textureFlags & MATERIAL_TEXTURE_NORMAL) != 0;
+            bool hasRoughnessMap = (textureFlags & MATERIAL_TEXTURE_ROUGHNESS) != 0;
+            bool hasMetallicMap = (textureFlags & MATERIAL_TEXTURE_METALLIC) != 0;
+#if ENABLE_AO
+            bool hasAOMap = (textureFlags & MATERIAL_TEXTURE_AO) != 0;
+#else
+            bool hasAOMap = false;
+#endif
+            bool hasOpacityMap = (textureFlags & MATERIAL_TEXTURE_OPACITY) != 0;
+            bool hasEmissionMap = (textureFlags & MATERIAL_TEXTURE_EMISSION) != 0;
+            
+            float2 texCoord = float2(0.0f);
+            if (hasBaseColorMap || hasNormalMap || hasRoughnessMap || hasMetallicMap || hasAOMap || hasOpacityMap || hasEmissionMap) {
+                texCoord = interpolateVertexAttribute(resource.uvs, intersection, resource.indices);
+                // Flip Y coordinate for USDZ textures (OpenGL style UV -> Metal style)
+                texCoord.y = 1.0f - texCoord.y;
+            }
+            
+            // Texture Sampler
+            constexpr sampler sampler(min_filter::linear, mag_filter::linear, mip_filter::linear, address::repeat);
+            
+            // Sample Textures
+            float4 baseColorSample = float4(1.0f);
+            if (hasBaseColorMap) {
+                 baseColorSample = resource.baseColorMap.sample(sampler, texCoord);
+                 albedo *= baseColorSample.rgb;
+            }
+            
+            // New PBR Textures
+            float roughness = 1.0f;
+            if (hasRoughnessMap) {
+                roughness = resource.roughnessMap.sample(sampler, texCoord).x;
+            }
+            
+            float metallic = 0.0f;
+            if (hasMetallicMap) {
+                metallic = resource.metallicMap.sample(sampler, texCoord).x;
+            }
+            
+            float ao = 1.0f;
+#if ENABLE_AO
+            if (hasAOMap) {
+                ao = resource.aoMap.sample(sampler, texCoord).x;
+            }
+#endif
+
+            float opacity = 1.0f;
+            if (hasOpacityMap) {
+                opacity = resource.opacityMap.sample(sampler, texCoord).x;
+            }
+            
+            float3 emission = resource.material->emission;
+            if (hasEmissionMap) {
+                emission = resource.emissionMap.sample(sampler, texCoord).xyz;
+            }
+            
+            // Debug Visualization
+            if (uniforms.debugTextureMode != DebugTextureModeNone) {
+                float3 debugColor = float3(0.0f);
+                if (uniforms.debugTextureMode == DebugTextureModeBaseColor) {
+                    debugColor = hasBaseColorMap ? baseColorSample.rgb : float3(1.0f, 0.0f, 1.0f); // Magenta if missing
+                } else if (uniforms.debugTextureMode == DebugTextureModeNormal) {
+                    if (hasNormalMap) {
+                         debugColor = resource.normalMap.sample(sampler, texCoord).xyz;
+                    } else {
+                         debugColor = float3(0.5f, 0.5f, 1.0f); // Flat normal
+                    }
+                } else if (uniforms.debugTextureMode == DebugTextureModeRoughness) {
+                    debugColor = float3(roughness);
+                } else if (uniforms.debugTextureMode == DebugTextureModeMetallic) {
+                    debugColor = float3(metallic);
+                } else if (uniforms.debugTextureMode == DebugTextureModeAO) {
+#if ENABLE_AO
+                    debugColor = float3(ao);
+#else
+                    debugColor = float3(1.0f, 0.0f, 1.0f); // AO disabled
+#endif
+                } else if (uniforms.debugTextureMode == DebugTextureModeEmission) {
+                    debugColor = emission;
+                } else if (uniforms.debugTextureMode == DebugTextureModeMotion) {
+                    float2 motionForViz = hadPrimaryHit ? motionVector : prevMotion;
+                    float rightScale = max(length(uniforms.camera.right), 1e-5f);
+                    float upScale = max(length(uniforms.camera.up), 1e-5f);
+                    float2 motionPixels = float2(
+                        motionForViz.x * (float(uniforms.width) / (2.0f * rightScale)),
+                        motionForViz.y * (float(uniforms.height) / (2.0f * upScale))
+                    );
+                    float2 scaled = clamp(motionPixels * 0.05f, -1.0f, 1.0f);
+                    float mag = clamp(length(motionPixels) * 0.1f, 0.0f, 1.0f);
+                    debugColor = float3(scaled.x * 0.5f + 0.5f, scaled.y * 0.5f + 0.5f, mag);
+                }
+                accumulatedColor = debugColor;
+                break; // Exit bounce loop for debug view
+            }
+            
+            float3 shadingNormal = worldSpaceSurfaceNormal;
+            if (hasNormalMap) {
+                float3 tangent;
+                float3 bitangent;
+                if (computeTangentBasis(resource.positions, resource.uvs, intersection, resource.indices, tangent, bitangent)) {
+                    float3 worldT = (objectToWorldSpaceTransform * float4(tangent, 0)).xyz;
+                    worldT = normalize(worldT - worldSpaceSurfaceNormal * dot(worldT, worldSpaceSurfaceNormal));
+                    float3 worldBOrtho = normalize(cross(worldSpaceSurfaceNormal, worldT));
+                    
+                    float3 nMap = resource.normalMap.sample(sampler, texCoord).xyz * 2.0f - 1.0f;
+                    shadingNormal = normalize(nMap.x * worldT + nMap.y * worldBOrtho + nMap.z * worldSpaceSurfaceNormal);
+                }
+            }
+
+            if (uniforms.enableDenoiseGBuffer != 0 && !wroteGBuffer && sampleIndex == 0) {
+                float roughnessForOutput = clamp(roughness, 0.0f, 1.0f);
+                float3 diffuseAlbedo = albedo * (1.0f - metallic);
+                float3 specularAlbedo = mix(float3(0.04f), albedo, metallic);
+                outDiffuseAlbedo = float4(diffuseAlbedo, 1.0f);
+                outSpecularAlbedo = float4(specularAlbedo, 1.0f);
+                outNormal = float4(shadingNormal * 0.5f + 0.5f, 1.0f);
+                outRoughness = float4(roughnessForOutput, 0.0f, 0.0f, 1.0f);
+                wroteGBuffer = true;
+            }
+
+            float clampedOpacity = clamp(opacity, 0.0f, 1.0f);
+            float ior = max(resource.material->refractionIndex, 1.0f);
+            bool consumeBounce = true;
+            bool skipLighting = false;
+            if (clampedOpacity < 0.999f || ior > 1.01f) {
+                float3 N = shadingNormal;
+                float3 I = ray.direction;
+                float cosi = clamp(dot(-I, N), -1.0f, 1.0f);
+                float etaI = 1.0f;
+                float etaT = ior;
+                if (cosi < 0.0f) {
+                    cosi = -cosi;
+                    N = -N;
+                    float tmp = etaI; etaI = etaT; etaT = tmp;
+                }
+                float eta = etaI / etaT;
+                float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
+                
+                float f0 = (etaT - etaI) / (etaT + etaI);
+                f0 = f0 * f0;
+                float F = f0 + (1.0f - f0) * pow(clamp(1.0f - cosi, 0.0f, 1.0f), 5.0f);
+                
+                float transmission = 1.0f - clampedOpacity;
+                float reflectWeight = F;
+                float refractWeight = (1.0f - F) * transmission;
+                float totalWeight = max(reflectWeight + refractWeight, 1e-4f);
+                float reflectProb = reflectWeight / totalWeight;
+                
+                float choice = halton(offset + frameOffset, 2 + step * 6 + 5);
+                
+                if (k < 0.0f || choice < reflectProb) {
+                    float3 reflectDir = normalize(I - 2.0f * dot(I, N) * N);
+                    ray.origin = worldSpaceIntersectionPoint + reflectDir * 1e-3f;
+                    ray.direction = reflectDir;
+                    color *= totalWeight;
+                } else {
+                    float cosT = sqrt(max(k, 0.0f));
+                    float3 refractDir = normalize(eta * I + (eta * cosi - cosT) * N);
+                    ray.origin = worldSpaceIntersectionPoint + refractDir * 1e-3f;
+                    ray.direction = refractDir;
+                    color *= totalWeight * albedo;
+                    consumeBounce = false;
+                }
+                skipLighting = true;
+            }
+
+            if (skipLighting) {
+                step++;
+                if (consumeBounce) {
+                    bounce++;
+                    transparencyPasses = 0;
+                } else {
+                    transparencyPasses++;
+                    if (transparencyPasses > uniforms.maxBounces) {
+                        bounce++;
+                        transparencyPasses = 0;
+                    }
+                }
+                continue;
+            }
+
+            float perceptualRoughness = clamp(roughness, 0.04f, 1.0f);
+            float alpha = perceptualRoughness * perceptualRoughness;
+            float3 diffuseColor = albedo;
+            float3 F0 = mix(float3(0.04f), albedo, metallic);
+            float3 V = normalize(-ray.direction);
+
+            // Emission (throughput-scaled)
+            accumulatedColor += color * emission;
             
             // Choose a random light source to sample.
-            float lightSample = halton(offset + frameOffset, 2 + bounce * 5 + 0);
+            float lightSample = halton(offset + frameOffset, 2 + step * 6 + 0);
             int lightIndex = min((int)(lightSample * uniforms.lightCount), uniforms.lightCount - 1);
             
             device Light &light = lights[lightIndex];
@@ -300,8 +589,8 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             if (light.type == LightTypeAreaLight) {
                 
                 // Choose a random point to sample on the light source.
-                r = float2(halton(offset + frameOffset, 2 + bounce * 5 + 1),
-                                  halton(offset + frameOffset, 2 + bounce * 5 + 2));
+                r = float2(halton(offset + frameOffset, 2 + step * 6 + 1),
+                                  halton(offset + frameOffset, 2 + step * 6 + 2));
 
                 // Sample the lighting between the intersection point and the point on the area light.
                 sampleAreaLight(light, r, worldSpaceIntersectionPoint, worldSpaceLightDirection,
@@ -345,24 +634,73 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 lightColor = light.color;
             }
             
-            // Scale the light color by the cosine of the angle between the light direction and
-            // surface normal.
-            lightColor *= saturate(dot(worldSpaceSurfaceNormal, worldSpaceLightDirection));
-
             // Scale the light color by the number of lights to compensate for the fact that
             // the sample only samples one light source at random.
             lightColor *= uniforms.lightCount;
 
-            // Scale the ray color by the color of the surface. This simulates light being absorbed into
-            // the surface.
-            color *= surfaceColor;
-            
-            // Early exit if color contribution becomes negligible
-            if (length(color) < 0.001) {
-                break;
+            if (uniforms.shadingMode == ShadingModeLegacy) {
+                float3 L = normalize(worldSpaceLightDirection);
+                float NdotL = saturate(dot(shadingNormal, L));
+                float3 legacyColor = color * albedo;
+
+                if (length(legacyColor) < 0.001) {
+                    break;
+                }
+
+                if (length(lightColor) > 0.0001 && NdotL > 0.0f) {
+                    struct ray shadowRay;
+                    shadowRay.origin = worldSpaceIntersectionPoint + worldSpaceSurfaceNormal * 1e-3f;
+                    shadowRay.direction = worldSpaceLightDirection;
+                    shadowRay.max_distance = lightDistance - 1e-3f;
+
+                    i.accept_any_intersection(true);
+                    intersection = i.intersect(shadowRay, accelerationStructure);
+
+                    if (intersection.type == intersection_type::none) {
+                        accumulatedColor += legacyColor * lightColor * NdotL;
+                    }
+                }
+
+                color = legacyColor * ao;
+                if (length(color) < 0.001) {
+                    break;
+                }
+
+                r = float2(halton(offset + frameOffset, 2 + step * 5 + 3),
+                           halton(offset + frameOffset, 2 + step * 5 + 4));
+
+                float3 worldSpaceSampleDirection = sampleCosineWeightedHemisphere(r);
+                worldSpaceSampleDirection = alignHemisphereWithNormal(worldSpaceSampleDirection, shadingNormal);
+
+                ray.origin = worldSpaceIntersectionPoint + worldSpaceSurfaceNormal * 1e-3f;
+                ray.direction = worldSpaceSampleDirection;
+
+                step++;
+                bounce++;
+                transparencyPasses = 0;
+                continue;
             }
             
             if (length(lightColor) > 0.0001) {
+                float3 L = normalize(worldSpaceLightDirection);
+                float3 H = normalize(V + L);
+                float NdotL = saturate(dot(shadingNormal, L));
+                float NdotV = saturate(dot(shadingNormal, V));
+                float NdotH = saturate(dot(shadingNormal, H));
+                float VdotH = saturate(dot(V, H));
+                
+                float3 F = fresnelSchlick(VdotH, F0);
+                float D = distributionGGX(NdotH, alpha);
+                float k = (perceptualRoughness + 1.0f);
+                k = (k * k) / 8.0f;
+                float G = geometrySmith(NdotV, NdotL, k);
+                
+                float3 specular = (D * G) * F / max(4.0f * NdotV * NdotL, 1e-4f);
+                float3 kS = F;
+                float3 kD = (1.0f - kS) * (1.0f - metallic);
+                float3 diffuse = kD * diffuseColor / M_PI_F;
+                
+                float3 direct = (diffuse + specular) * lightColor * NdotL;
             
                 // Compute the shadow ray. The shadow ray checks if the sample position on the
                 // light source is visible from the current intersection point.
@@ -393,8 +731,17 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 // If there was no intersection, then the light source is visible from the original
                 // intersection  point. Add the light's contribution to the image.
                 if (intersection.type == intersection_type::none) {
-                    accumulatedColor += lightColor * color;
+                    accumulatedColor += color * direct;
                 }
+            }
+
+            // Update throughput for next bounce (diffuse only)
+            // Apply AO to indirect only to avoid darkening direct lighting too much.
+            color *= diffuseColor * (1.0f - metallic) * ao;
+            
+            // Early exit if contribution becomes negligible
+            if (length(color) < 0.001) {
+                break;
             }
 
             // Next choose a random direction to continue the path of the ray. This will
@@ -405,14 +752,18 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             // sample direction and surface normal, the math entirely cancels out except for
             // multiplying by the surface color. This sampling strategy also reduces the amount
             // of noise in the output image.
-            r = float2(halton(offset + frameOffset, 2 + bounce * 5 + 3),
-                       halton(offset + frameOffset, 2 + bounce * 5 + 4));
+            r = float2(halton(offset + frameOffset, 2 + step * 5 + 3),
+                       halton(offset + frameOffset, 2 + step * 5 + 4));
 
             float3 worldSpaceSampleDirection = sampleCosineWeightedHemisphere(r);
-            worldSpaceSampleDirection = alignHemisphereWithNormal(worldSpaceSampleDirection, worldSpaceSurfaceNormal);
+            worldSpaceSampleDirection = alignHemisphereWithNormal(worldSpaceSampleDirection, shadingNormal);
 
             ray.origin = worldSpaceIntersectionPoint + worldSpaceSurfaceNormal * 1e-3f;
             ray.direction = worldSpaceSampleDirection;
+            
+            step++;
+            bounce++;
+            transparencyPasses = 0;
         }
         
         totalColor += accumulatedColor;
@@ -424,10 +775,36 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
     // Average this frame's sample with all of the previous frames.
     if (uniforms.frameIndex > 0) {
         float3 prevColor = prevTex.read(tid).xyz;
-        prevColor *= uniforms.frameIndex;
-
-        totalColor += prevColor;
-        totalColor /= (uniforms.frameIndex + 1);
+        float historyWeight = clamp(uniforms.accumulationWeight, 0.0f, 0.95f);
+        if (uniforms.enableMotionAdaptiveAccumulation != 0) {
+            float rightScale = max(length(uniforms.camera.right), 1e-5f);
+            float upScale = max(length(uniforms.camera.up), 1e-5f);
+            
+            // Calculate motion pixels for current frame
+            float2 currentMotionPixels = float2(
+                motionVector.x * (float(uniforms.width) / (2.0f * rightScale)),
+                motionVector.y * (float(uniforms.height) / (2.0f * upScale))
+            );
+            
+            // Calculate motion pixels for previous frame
+            float2 prevMotionPixels = float2(
+                prevMotion.x * (float(uniforms.width) / (2.0f * rightScale)),
+                prevMotion.y * (float(uniforms.height) / (2.0f * upScale))
+            );
+            
+            // Use the maximum motion to determine accumulation weight.
+            // This handles cases where an object stops (current is 0, prev was high)
+            // or disocclusion (current is 0 (background), prev was high (foreground object))
+            float motionMag = max(length(currentMotionPixels), length(prevMotionPixels));
+            
+            float low = max(uniforms.motionAccumulationLowThresholdPixels, 0.0f);
+            float high = max(uniforms.motionAccumulationHighThresholdPixels, low + 1e-3f);
+            float t = clamp((motionMag - low) / (high - low), 0.0f, 1.0f);
+            float minWeight = clamp(uniforms.motionAccumulationMinWeight, 0.0f, 0.95f);
+            minWeight = min(minWeight, historyWeight);
+            historyWeight = mix(historyWeight, minWeight, t);
+        }
+        totalColor = mix(totalColor, prevColor, historyWeight);
     }
 
     dstTex.write(float4(totalColor, 1.0f), tid);
@@ -435,6 +812,11 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
     // Write depth and motion for temporal scaler (if textures are bound)
     depthTex.write(primaryDepth, tid);
     motionTex.write(float4(motionVector, 0.0f, 0.0f), tid);
+    if (uniforms.enableDenoiseGBuffer != 0) {
+        diffuseAlbedoTex.write(outDiffuseAlbedo, tid);
+        specularAlbedoTex.write(outSpecularAlbedo, tid);
+        normalTex.write(outNormal, tid);
+        roughnessTex.write(outRoughness, tid);
+    }
     }
 }
-

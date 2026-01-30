@@ -8,10 +8,14 @@
 
 /* Begin PBXBuildFile section */
 		0651580BC0364C7DA3F142A6 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4B2278C8505008FE76D /* AppDelegate.swift */; };
+		09139FC32F2867E200CC8CE3 /* Skinning.metal in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC22F2867E200CC8CE3 /* Skinning.metal */; };
+		09139FC42F2867E200CC8CE3 /* Skinning.metal in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC22F2867E200CC8CE3 /* Skinning.metal */; };
+		09139FC62F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */; };
+		09139FC72F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */; };
 		19FE4824D30E446ABD8103FE /* AssetResources in Resources */ = {isa = PBXBuildFile; fileRef = 8E90E4D4278C8A6F008FE76D /* AssetResources */; };
 		25A611BA81614E5EB6429F1C /* Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4B6278C8505008FE76D /* Renderer.swift */; };
 		7738A914C2244005AD51A814 /* Scene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4C8278C853B008FE76D /* Scene.swift */; };
-		77FD211607D24EC9A1D39843 /* DragonScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CA278C8542008FE76D /* DragonScene.swift */; };
+		77FD211607D24EC9A1D39843 /* AppScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CA278C8542008FE76D /* AppScene.swift */; };
 		7D69ADEBDBF94933A87DEDA2 /* Mesh.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CC278C854B008FE76D /* Mesh.swift */; };
 		81A4AB78C21D4273991CA611 /* GameViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4B4278C8505008FE76D /* GameViewController.swift */; };
 		89A79092851045318ADCDF5E /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8E90E4BB278C8505008FE76D /* Assets.xcassets */; };
@@ -23,7 +27,7 @@
 		8E90E4BF278C8505008FE76D /* Main.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 8E90E4BD278C8505008FE76D /* Main.storyboard */; };
 		8E90E4C7278C852F008FE76D /* Raytracing.metal in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4C6278C852F008FE76D /* Raytracing.metal */; };
 		8E90E4C9278C853B008FE76D /* Scene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4C8278C853B008FE76D /* Scene.swift */; };
-		8E90E4CB278C8542008FE76D /* DragonScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CA278C8542008FE76D /* DragonScene.swift */; };
+		8E90E4CB278C8542008FE76D /* AppScene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CA278C8542008FE76D /* AppScene.swift */; };
 		8E90E4CD278C854B008FE76D /* Mesh.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CC278C854B008FE76D /* Mesh.swift */; };
 		8E90E4CF278C8550008FE76D /* Model.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4CE278C8550008FE76D /* Model.swift */; };
 		8E90E4D1278C855B008FE76D /* SubMesh.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4D0278C855B008FE76D /* SubMesh.swift */; };
@@ -37,6 +41,9 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		09139FC22F2867E200CC8CE3 /* Skinning.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Skinning.metal; sourceTree = "<group>"; };
+		09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkinningDebugTests.swift; sourceTree = "<group>"; };
+		09139FF32F2C1FAE00CC8CE3 /* MetalRaytracing-iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "MetalRaytracing-iOS.entitlements"; sourceTree = "<group>"; };
 		8E90E4AF278C8505008FE76D /* MetalRaytracing.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MetalRaytracing.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8E90E4B2278C8505008FE76D /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		8E90E4B4278C8505008FE76D /* GameViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GameViewController.swift; sourceTree = "<group>"; };
@@ -48,7 +55,7 @@
 		8E90E4C0278C8505008FE76D /* MetalRaytracing.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = MetalRaytracing.entitlements; sourceTree = "<group>"; };
 		8E90E4C6278C852F008FE76D /* Raytracing.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Raytracing.metal; sourceTree = "<group>"; };
 		8E90E4C8278C853B008FE76D /* Scene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Scene.swift; sourceTree = "<group>"; };
-		8E90E4CA278C8542008FE76D /* DragonScene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DragonScene.swift; sourceTree = "<group>"; };
+		8E90E4CA278C8542008FE76D /* AppScene.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppScene.swift; sourceTree = "<group>"; };
 		8E90E4CC278C854B008FE76D /* Mesh.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Mesh.swift; sourceTree = "<group>"; };
 		8E90E4CE278C8550008FE76D /* Model.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Model.swift; sourceTree = "<group>"; };
 		8E90E4D0278C855B008FE76D /* SubMesh.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubMesh.swift; sourceTree = "<group>"; };
@@ -78,6 +85,7 @@
 		8E90E4A6278C8505008FE76D = {
 			isa = PBXGroup;
 			children = (
+				09139FF32F2C1FAE00CC8CE3 /* MetalRaytracing-iOS.entitlements */,
 				8E90E4D4278C8A6F008FE76D /* AssetResources */,
 				8E90E4B1278C8505008FE76D /* MetalRaytracing */,
 				8E90E4B0278C8505008FE76D /* Products */,
@@ -96,11 +104,13 @@
 		8E90E4B1278C8505008FE76D /* MetalRaytracing */ = {
 			isa = PBXGroup;
 			children = (
+				09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */,
+				09139FC22F2867E200CC8CE3 /* Skinning.metal */,
 				8E90E4B2278C8505008FE76D /* AppDelegate.swift */,
 				8E90E4B4278C8505008FE76D /* GameViewController.swift */,
 				8E90E4B6278C8505008FE76D /* Renderer.swift */,
 				8E90E4C8278C853B008FE76D /* Scene.swift */,
-				8E90E4CA278C8542008FE76D /* DragonScene.swift */,
+				8E90E4CA278C8542008FE76D /* AppScene.swift */,
 				8E90E4CE278C8550008FE76D /* Model.swift */,
 				8E90E4D2278C8586008FE76D /* Utilities.swift */,
 				8E90E4D0278C855B008FE76D /* SubMesh.swift */,
@@ -220,7 +230,9 @@
 				8E90E4D1278C855B008FE76D /* SubMesh.swift in Sources */,
 				8E90E4D3278C8586008FE76D /* Utilities.swift in Sources */,
 				8E90E4C7278C852F008FE76D /* Raytracing.metal in Sources */,
-				8E90E4CB278C8542008FE76D /* DragonScene.swift in Sources */,
+				09139FC32F2867E200CC8CE3 /* Skinning.metal in Sources */,
+				8E90E4CB278C8542008FE76D /* AppScene.swift in Sources */,
+				09139FC62F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */,
 				8E90E4CD278C854B008FE76D /* Mesh.swift in Sources */,
 				8E90E4B9278C8505008FE76D /* Shaders.metal in Sources */,
 				8E90E4C9278C853B008FE76D /* Scene.swift in Sources */,
@@ -238,7 +250,9 @@
 				B4470A49650F4FDD82868E4A /* SubMesh.swift in Sources */,
 				B3B323E8CEF6490D9FC0419B /* Utilities.swift in Sources */,
 				A417CB6B4B4741189E73780B /* Raytracing.metal in Sources */,
-				77FD211607D24EC9A1D39843 /* DragonScene.swift in Sources */,
+				09139FC42F2867E200CC8CE3 /* Skinning.metal in Sources */,
+				77FD211607D24EC9A1D39843 /* AppScene.swift in Sources */,
+				09139FC72F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */,
 				7D69ADEBDBF94933A87DEDA2 /* Mesh.swift in Sources */,
 				BC535F700E474FC4B70C95C1 /* Shaders.metal in Sources */,
 				7738A914C2244005AD51A814 /* Scene.swift in Sources */,
@@ -267,12 +281,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "MetalRaytracing-iOS.entitlements";
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 1;
 				DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = YES;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
@@ -298,12 +315,15 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				CODE_SIGN_ENTITLEMENTS = "MetalRaytracing-iOS.entitlements";
+				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Manual;
 				CURRENT_PROJECT_VERSION = 1;
 				DERIVE_MACCATALYST_PRODUCT_BUNDLE_IDENTIFIER = YES;
 				DEVELOPMENT_TEAM = "";
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations = "UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",

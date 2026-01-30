@@ -10,8 +10,6 @@
 		0651580BC0364C7DA3F142A6 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4B2278C8505008FE76D /* AppDelegate.swift */; };
 		09139FC32F2867E200CC8CE3 /* Skinning.metal in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC22F2867E200CC8CE3 /* Skinning.metal */; };
 		09139FC42F2867E200CC8CE3 /* Skinning.metal in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC22F2867E200CC8CE3 /* Skinning.metal */; };
-		09139FC62F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */; };
-		09139FC72F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */; };
 		19FE4824D30E446ABD8103FE /* AssetResources in Resources */ = {isa = PBXBuildFile; fileRef = 8E90E4D4278C8A6F008FE76D /* AssetResources */; };
 		25A611BA81614E5EB6429F1C /* Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4B6278C8505008FE76D /* Renderer.swift */; };
 		7738A914C2244005AD51A814 /* Scene.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8E90E4C8278C853B008FE76D /* Scene.swift */; };
@@ -42,7 +40,6 @@
 
 /* Begin PBXFileReference section */
 		09139FC22F2867E200CC8CE3 /* Skinning.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Skinning.metal; sourceTree = "<group>"; };
-		09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SkinningDebugTests.swift; sourceTree = "<group>"; };
 		09139FF32F2C1FAE00CC8CE3 /* MetalRaytracing-iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "MetalRaytracing-iOS.entitlements"; sourceTree = "<group>"; };
 		8E90E4AF278C8505008FE76D /* MetalRaytracing.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MetalRaytracing.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		8E90E4B2278C8505008FE76D /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -104,7 +101,6 @@
 		8E90E4B1278C8505008FE76D /* MetalRaytracing */ = {
 			isa = PBXGroup;
 			children = (
-				09139FC52F29BC2600CC8CE3 /* SkinningDebugTests.swift */,
 				09139FC22F2867E200CC8CE3 /* Skinning.metal */,
 				8E90E4B2278C8505008FE76D /* AppDelegate.swift */,
 				8E90E4B4278C8505008FE76D /* GameViewController.swift */,
@@ -232,7 +228,6 @@
 				8E90E4C7278C852F008FE76D /* Raytracing.metal in Sources */,
 				09139FC32F2867E200CC8CE3 /* Skinning.metal in Sources */,
 				8E90E4CB278C8542008FE76D /* AppScene.swift in Sources */,
-				09139FC62F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */,
 				8E90E4CD278C854B008FE76D /* Mesh.swift in Sources */,
 				8E90E4B9278C8505008FE76D /* Shaders.metal in Sources */,
 				8E90E4C9278C853B008FE76D /* Scene.swift in Sources */,
@@ -252,7 +247,6 @@
 				A417CB6B4B4741189E73780B /* Raytracing.metal in Sources */,
 				09139FC42F2867E200CC8CE3 /* Skinning.metal in Sources */,
 				77FD211607D24EC9A1D39843 /* AppScene.swift in Sources */,
-				09139FC72F29BC2600CC8CE3 /* SkinningDebugTests.swift in Sources */,
 				7D69ADEBDBF94933A87DEDA2 /* Mesh.swift in Sources */,
 				BC535F700E474FC4B70C95C1 /* Shaders.metal in Sources */,
 				7738A914C2244005AD51A814 /* Scene.swift in Sources */,

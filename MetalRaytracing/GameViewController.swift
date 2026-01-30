@@ -459,9 +459,6 @@ class GameViewController: UIViewController {
         renderer = newRenderer
 
         renderer.mtkView(mtkView, drawableSizeWillChange: mtkView.drawableSize)
-//        if let exportURL = renderer.runSkinningDebugTestsExportingToTmp() {
-//            print("CPU skinning export dir:", exportURL.path)
-//        }
         mtkView.delegate = renderer
         
         setupGestures()

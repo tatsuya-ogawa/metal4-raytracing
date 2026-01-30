@@ -109,7 +109,7 @@ extension MTL4CommandQueue {
         let scratchBufferSize = descriptorsAndSizes.map(\.1.buildScratchBufferSize).max()!
         guard
             let scratchBuffer = device.makeBuffer(length: scratchBufferSize, options: .storageModePrivate),
-            let compactedSizesBuffer = device.makeBuffer(length: MemoryLayout<UInt64>.stride * descriptors.count, options: .storageModeShared)
+            let compactedSizesBuffer = device.makeBuffer(length: MemoryLayout<UInt64>.stride * descriptors.count, options: CommonStorageMode.options)
         else { return [] }
         scratchBuffer.label = "Scratch Buffer"
         compactedSizesBuffer.label = "Compacted Sizes Buffer"
@@ -217,20 +217,78 @@ extension MTL4CommandQueue {
     func buildCompactedAccelerationStructure<T: MTL4AccelerationStructureDescriptor>(with descriptor: T, residencySet: MTLResidencySet? = nil) -> MTLAccelerationStructure? {
         return buildCompactedAccelerationStructures(for: [descriptor], residencySet: residencySet).first
     }
-}
-
-
-extension MTLPackedFloat4x3 {
-    static func matrix4x4_drop_last_row(_ m: matrix_float4x4) -> MTLPackedFloat4x3 {
-        return MTLPackedFloat4x3.init(columns: (
-            MTLPackedFloat3(m.columns.0.x, m.columns.0.y, m.columns.0.z),
-            MTLPackedFloat3(m.columns.1.x, m.columns.1.y, m.columns.1.z),
-            MTLPackedFloat3(m.columns.2.x, m.columns.2.y, m.columns.2.z),
-            MTLPackedFloat3(m.columns.3.x, m.columns.3.y, m.columns.3.z)
-        ))
+    
+    func buildAccelerationStructures<T: MTL4AccelerationStructureDescriptor>(for descriptors: [T], residencySet: MTLResidencySet? = nil) -> [MTLAccelerationStructure] {
+        guard !descriptors.isEmpty else { return [] }
+        
+        let descriptorsAndSizes = descriptors.map { descriptor -> (T, MTLAccelerationStructureSizes) in
+            let sizes = device.accelerationStructureSizes(descriptor: descriptor)
+            return (descriptor, sizes)
+        }
+        
+        let scratchBufferSize = descriptorsAndSizes.map(\.1.buildScratchBufferSize).max()!
+        guard
+            let scratchBuffer = device.makeBuffer(length: scratchBufferSize, options: .storageModePrivate)
+        else { return [] }
+        scratchBuffer.label = "Scratch Buffer"
+        
+        func bufferRange(_ buffer: MTLBuffer, offset: Int = 0, length: Int? = nil) -> MTL4BufferRange {
+            let rangeLength = length ?? (buffer.length - offset)
+            return MTL4BufferRange(bufferAddress: buffer.gpuAddress + UInt64(offset), length: UInt64(rangeLength))
+        }
+        
+        func commitAndWait(_ commandBuffer: MTL4CommandBuffer) {
+            let event = device.makeSharedEvent()!
+            event.signaledValue = 0
+            commit([commandBuffer])
+            signalEvent(event, value: 1)
+            while !event.wait(untilSignaledValue: 1, timeoutMS: 1000) {}
+        }
+        
+        guard let buildAllocator = device.makeCommandAllocator(),
+              let buildCommandBuffer = device.makeCommandBuffer()
+        else { return [] }
+        buildCommandBuffer.label = "CommandBuffer BuildAccelerationStructures"
+        buildCommandBuffer.beginCommandBuffer(allocator: buildAllocator)
+        guard let buildEncoder = buildCommandBuffer.makeComputeCommandEncoder() else { return [] }
+        buildEncoder.label = "CommandEncoder BuildAccelerationStructures"
+        
+        let scratchRange = bufferRange(scratchBuffer)
+        
+        var accelerationStructures: [MTLAccelerationStructure] = []
+        accelerationStructures.reserveCapacity(descriptorsAndSizes.count)
+        
+        // Create a local residency set for the scratch buffer and new acceleration structures
+        let localResidencySetDescriptor = MTLResidencySetDescriptor()
+        localResidencySetDescriptor.initialCapacity = descriptors.count + 1
+        let localResidencySet = try! device.makeResidencySet(descriptor: localResidencySetDescriptor)
+        
+        var allocations: [any MTLAllocation] = [scratchBuffer]
+        
+        for (index, descriptorAndSizes) in descriptorsAndSizes.enumerated() {
+            let (descriptor, sizes) = descriptorAndSizes
+            let accelerationStructure = device.makeAccelerationStructure(size: sizes.accelerationStructureSize)!
+            accelerationStructures.append(accelerationStructure)
+            allocations.append(accelerationStructure)
+            accelerationStructure.label = "AccelerationStructure \(index)"
+            buildEncoder.build(destinationAccelerationStructure: accelerationStructure, descriptor: descriptor, scratchBuffer: scratchRange)
+        }
+        
+        localResidencySet.addAllocations(allocations)
+        localResidencySet.commit()
+        
+        if let residencySet = residencySet {
+            buildCommandBuffer.useResidencySet(residencySet)
+        }
+        buildCommandBuffer.useResidencySet(localResidencySet)
+        
+        buildEncoder.endEncoding()
+        buildCommandBuffer.endCommandBuffer()
+        commitAndWait(buildCommandBuffer)
+        
+        return accelerationStructures
     }
 }
-
 extension MTLPackedFloat3 {
     init(_ x: Float, _ y: Float, _ z: Float) {
         var p = MTLPackedFloat3()

@@ -18,6 +18,9 @@ This project extends the original sample to experiment with **Metal4FX** capabil
   
 - **Advanced Rendering Pipeline**:
   - **MetalFX Integration**: Support for both Spatial and Temporal upscaling, toggleable at runtime.
+  - **USDZ Support**: Seamless loading and raytracing of USDZ models.
+  - **Skinning Animation**: GPU-accelerated skeletal animation for dynamic characters.
+  - **PBR Materials**: Full Physically Based Rendering support (Base Color, Normal, Roughness, Metallic, AO, Emission).
 
 ### Requirements
 
@@ -28,4 +31,5 @@ This project extends the original sample to experiment with **Metal4FX** capabil
 
 ### License
 
-This library is released under the MIT license. See [LICENSE](LICENSE) for details.
+* This library is released under the MIT license. See [LICENSE](LICENSE) for details.
+* The model file (`AssetResources/robot.usdz`) includes a separate license. Please refer to [AssetResources/LICENSE.txt](AssetResources/LICENSE.txt) for the model-specific terms and conditions.

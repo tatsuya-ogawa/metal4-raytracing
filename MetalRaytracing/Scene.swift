@@ -18,7 +18,57 @@ class Scene {
     var cameraFovDegrees: Float
 
     var lights: [Light]
+
     var lightBuffer: MTLBuffer
+    
+    var isDirty: Bool = false
+    
+    func moveModel(index: Int, forward: Float, right: Float) {
+        guard index < models.count else { return }
+        let model = models[index]
+        var changed = false
+        if forward != 0 {
+            model.forward(direction: forward)
+            changed = true
+        }
+        if right != 0 {
+            model.strafe(direction: right)
+            changed = true
+        }
+        if changed {
+            isDirty = true
+        }
+    }
+    
+    func rotateModel(index: Int, angle: Float) {
+        guard index < models.count else { return }
+        if angle != 0 {
+            models[index].rotateY(angle: angle)
+            isDirty = true
+        }
+    }
+    
+    func setModelRotation(index: Int, angle: Float) {
+        guard index < models.count else { return }
+        models[index].setRotationY(angle: angle)
+        isDirty = true
+    }
+
+    func setLightIntensity(_ intensity: Float) {
+        // Update all lights to this intensity
+        for i in 0..<lights.count {
+            lights[i].color = SIMD3<Float>(intensity, intensity, intensity)
+        }
+        updateLightBuffer()
+    }
+    
+    private func updateLightBuffer() {
+        let pointer = lightBuffer.contents()
+        pointer.copyMemory(from: lights, byteCount: MemoryLayout<Light>.stride * lights.count)
+#if os(macOS)
+        lightBuffer.didModifyRange(0..<lightBuffer.length)
+#endif
+    }
     
     init(size: CGSize, device: MTLDevice) {
         self.camera = Scene.setupCamera(size: size)

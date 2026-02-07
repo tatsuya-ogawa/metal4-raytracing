@@ -275,6 +275,7 @@ private extension Material {
         self.init()
         self.textureFlags = 0
         self.refractionIndex = 1.0
+        self.opacity = 1.0
         if let baseColor = material?.property(with: .baseColor), baseColor.type == .float3 {
             self.baseColor = baseColor.float3Value
         }else if let baseColor = material?.property(with: .baseColor), baseColor.type == .texture {
@@ -292,6 +293,14 @@ private extension Material {
         }
         if let refractionIndex = material?.property(with: .materialIndexOfRefraction), refractionIndex.type == .float {
             self.refractionIndex = refractionIndex.floatValue
+        }
+        if let opacity = material?.property(with: .opacity) {
+            if opacity.type == .float {
+                self.opacity = opacity.floatValue
+            } else if opacity.type == .float3 {
+                self.opacity = opacity.float3Value.x
+            }
+            self.opacity = min(max(self.opacity, 0.0), 1.0)
         }
     }
 }

@@ -136,6 +136,7 @@ struct Material {
   vector_float3 emission;
   float specularExponent;
   float refractionIndex;
+  float opacity;
   unsigned int textureFlags;
 };
 

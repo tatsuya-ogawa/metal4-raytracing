@@ -432,9 +432,9 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             }
 #endif
 
-            float opacity = 1.0f;
+            float opacity = clamp(resource.material->opacity, 0.0f, 1.0f);
             if (hasOpacityMap) {
-                opacity = resource.opacityMap.sample(sampler, texCoord).x;
+                opacity *= resource.opacityMap.sample(sampler, texCoord).x;
             }
             
             float3 emission = resource.material->emission;

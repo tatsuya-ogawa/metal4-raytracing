@@ -123,6 +123,10 @@ struct Uniforms {
   float motionAccumulationMinWeight;
   float motionAccumulationLowThresholdPixels;
   float motionAccumulationHighThresholdPixels;
+  int enableMotionAdaptiveSampling;
+  int motionSamplingMaxExtraSamples;
+  float motionSamplingLowThresholdPixels;
+  float motionSamplingHighThresholdPixels;
 };
 
 typedef NS_ENUM(NSInteger, ShadingMode) {

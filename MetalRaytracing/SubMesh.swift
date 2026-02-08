@@ -268,6 +268,24 @@ class Submesh {
         self.materialBuffer.label = "\(modelName) Material"
         self.mask = mask
     }
+
+    func applyMaterialOverride(_ materialOverride: ModelMaterialOverride) {
+        if let baseColor = materialOverride.baseColor {
+            material.baseColor = baseColor
+        }
+        if let refractionIndex = materialOverride.refractionIndex {
+            material.refractionIndex = max(refractionIndex, 1.0)
+        }
+        if let opacity = materialOverride.opacity {
+            material.opacity = min(max(opacity, 0.0), 1.0)
+        }
+
+        var updatedMaterial = material
+        materialBuffer.contents().copyMemory(from: &updatedMaterial, byteCount: MemoryLayout<Material>.stride)
+#if os(macOS)
+        materialBuffer.didModifyRange(0..<materialBuffer.length)
+#endif
+    }
 }
 
 private extension Material {

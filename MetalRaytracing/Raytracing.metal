@@ -248,7 +248,9 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         float2 prevMotion = motionTex.read(tid).xy;
         
         // For temporal scaler: track first hit for depth and motion
-        float primaryDepth = 0.0f;
+        // Initialize depth to "far" so miss pixels don't look like near hits.
+        float primaryDepth = 1.0e8f;
+        // Motion is stored in pixel units (+X right, +Y down).
         float2 motionVector = float2(0.0f);
         bool hadPrimaryHit = false;
         
@@ -258,9 +260,14 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         float4 outRoughness = float4(0.0f);
         bool wroteGBuffer = false;
         
-        // Multiple samples per pixel
-        for (int sampleIndex = 0; sampleIndex < uniforms.samplesPerPixel; sampleIndex++) {
-            int frameOffset = uniforms.frameIndex * uniforms.samplesPerPixel + sampleIndex;
+        int baseSamples = max(uniforms.samplesPerPixel, 1);
+        int maxExtraSamples = (uniforms.enableMotionAdaptiveSampling != 0) ? max(uniforms.motionSamplingMaxExtraSamples, 0) : 0;
+        int sampleStride = baseSamples + maxExtraSamples;
+        int totalSamples = baseSamples;
+        
+        // Multiple samples per pixel (motion-adaptive)
+        for (int sampleIndex = 0; sampleIndex < totalSamples; sampleIndex++) {
+            int frameOffset = uniforms.frameIndex * sampleStride + sampleIndex;
             
             // Add a random offset to the pixel coordinates for antialiasing.
             float2 r = float2(halton(offset + frameOffset, 0),
@@ -333,9 +340,6 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             
             // Store depth and motion for first bounce (primary ray)
             if (bounce == 0 && sampleIndex == 0) {
-                // Depth from camera
-                primaryDepth = intersection.distance;
-                
                 // Compute object-space position and previous object-space position
                 float3 objectSpacePos = interpolateVertexAttribute(resource.positions, intersection, resource.indices);
                 float3 prevObjectSpacePos = interpolateVertexAttribute(resource.previousPositions, intersection, resource.indices);
@@ -359,6 +363,7 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 screenPos.x = dot(viewPos, camera.right);
                 screenPos.y = dot(viewPos, camera.up);
                 float depth = dot(viewPos, camera.forward);
+                primaryDepth = max(depth, 1.0e-3f);
                 screenPos /= max(depth, 0.001f);
                 
                 // Project previous position
@@ -370,8 +375,16 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 float prevDepth = dot(prevViewPos, prevCamera.forward);
                 prevScreenPos /= max(prevDepth, 0.001f);
                 
-                // Motion vector in screen space
-                motionVector = screenPos - prevScreenPos;
+                // Motion vector in pixel units (+Y down for texture space).
+                float2 motionNdc = screenPos - prevScreenPos;
+                float rightScale = max(length(camera.right), 1e-5f);
+                float upScale = max(length(camera.up), 1e-5f);
+                float2 motionPixels = float2(
+                    motionNdc.x * (float(uniforms.width) / (2.0f * rightScale)),
+                    motionNdc.y * (float(uniforms.height) / (2.0f * upScale))
+                );
+                motionPixels.y = -motionPixels.y;
+                motionVector = motionPixels;
                 hadPrimaryHit = true;
             }
             
@@ -451,7 +464,8 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                     if (hasNormalMap) {
                          debugColor = resource.normalMap.sample(sampler, texCoord).xyz;
                     } else {
-                         debugColor = float3(0.5f, 0.5f, 1.0f); // Flat normal
+                         // Show geometric normal when a normal map is not present.
+                         debugColor = worldSpaceSurfaceNormal * 0.5f + 0.5f;
                     }
                 } else if (uniforms.debugTextureMode == DebugTextureModeRoughness) {
                     debugColor = float3(roughness);
@@ -466,13 +480,7 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 } else if (uniforms.debugTextureMode == DebugTextureModeEmission) {
                     debugColor = emission;
                 } else if (uniforms.debugTextureMode == DebugTextureModeMotion) {
-                    float2 motionForViz = hadPrimaryHit ? motionVector : prevMotion;
-                    float rightScale = max(length(uniforms.camera.right), 1e-5f);
-                    float upScale = max(length(uniforms.camera.up), 1e-5f);
-                    float2 motionPixels = float2(
-                        motionForViz.x * (float(uniforms.width) / (2.0f * rightScale)),
-                        motionForViz.y * (float(uniforms.height) / (2.0f * upScale))
-                    );
+                    float2 motionPixels = hadPrimaryHit ? motionVector : prevMotion;
                     float2 scaled = clamp(motionPixels * 0.05f, -1.0f, 1.0f);
                     float mag = clamp(length(motionPixels) * 0.1f, 0.0f, 1.0f);
                     debugColor = float3(scaled.x * 0.5f + 0.5f, scaled.y * 0.5f + 0.5f, mag);
@@ -767,30 +775,31 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         }
         
         totalColor += accumulatedColor;
+        
+        if (sampleIndex == 0 && maxExtraSamples > 0) {
+            float2 currentMotionPixels = motionVector;
+            float2 prevMotionPixels = prevMotion;
+            float motionMag = max(length(currentMotionPixels), length(prevMotionPixels));
+            float low = max(uniforms.motionSamplingLowThresholdPixels, 0.0f);
+            float high = max(uniforms.motionSamplingHighThresholdPixels, low + 1e-3f);
+            float t = clamp((motionMag - low) / (high - low), 0.0f, 1.0f);
+            int extraSamples = (int)round(t * float(maxExtraSamples));
+            extraSamples = clamp(extraSamples, 0, maxExtraSamples);
+            totalSamples = baseSamples + extraSamples;
+        }
     } // End of samples loop
     
     // Average all samples
-    totalColor /= uniforms.samplesPerPixel;
+    totalColor /= float(max(totalSamples, 1));
                     
     // Average this frame's sample with all of the previous frames.
     if (uniforms.frameIndex > 0) {
         float3 prevColor = prevTex.read(tid).xyz;
         float historyWeight = clamp(uniforms.accumulationWeight, 0.0f, 0.95f);
         if (uniforms.enableMotionAdaptiveAccumulation != 0) {
-            float rightScale = max(length(uniforms.camera.right), 1e-5f);
-            float upScale = max(length(uniforms.camera.up), 1e-5f);
-            
-            // Calculate motion pixels for current frame
-            float2 currentMotionPixels = float2(
-                motionVector.x * (float(uniforms.width) / (2.0f * rightScale)),
-                motionVector.y * (float(uniforms.height) / (2.0f * upScale))
-            );
-            
-            // Calculate motion pixels for previous frame
-            float2 prevMotionPixels = float2(
-                prevMotion.x * (float(uniforms.width) / (2.0f * rightScale)),
-                prevMotion.y * (float(uniforms.height) / (2.0f * upScale))
-            );
+            // Motion vectors are already in pixel units.
+            float2 currentMotionPixels = motionVector;
+            float2 prevMotionPixels = prevMotion;
             
             // Use the maximum motion to determine accumulation weight.
             // This handles cases where an object stops (current is 0, prev was high)

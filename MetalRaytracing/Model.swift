@@ -8,6 +8,24 @@
 import MetalKit
 import ModelIO
 
+struct ModelMaterialOverride {
+    var baseColor: SIMD3<Float>?
+    var refractionIndex: Float?
+    var opacity: Float?
+
+    init(baseColor: SIMD3<Float>? = nil, refractionIndex: Float? = nil, opacity: Float? = nil) {
+        self.baseColor = baseColor
+        self.refractionIndex = refractionIndex
+        self.opacity = opacity
+    }
+
+    static func glass(tint: SIMD3<Float> = SIMD3<Float>(0.95, 0.98, 1.0),
+                      refractionIndex: Float = 1.52,
+                      opacity: Float = 0.08) -> ModelMaterialOverride {
+        ModelMaterialOverride(baseColor: tint, refractionIndex: refractionIndex, opacity: opacity)
+    }
+}
+
 class Model {
     var meshes: [Mesh]
     var skeleton: Skeleton?
@@ -24,7 +42,12 @@ class Model {
     var rotation: SIMD3<Float>
     var scale: Float
     
-    init(name: String, position: SIMD3<Float>, rotation: SIMD3<Float> = [0, 0, 0], scale: Float, on device: MTLDevice) {
+    init(name: String,
+         position: SIMD3<Float>,
+         rotation: SIMD3<Float> = [0, 0, 0],
+         scale: Float,
+         materialOverride: ModelMaterialOverride? = nil,
+         on device: MTLDevice) {
         self.position = position
         self.rotation = rotation
         self.scale = scale
@@ -166,6 +189,17 @@ class Model {
             self.meshes = mdlMeshes.map { mdlMesh -> Mesh in
                 let mtkMesh = try! MTKMesh(mesh: mdlMesh, device: device)
                 return Mesh(modelName: name, mdlMesh: mdlMesh, mtkMesh: mtkMesh, position: position, rotation: rotation, scale: scale, on: device)
+            }
+        }
+
+        applyMaterialOverride(materialOverride)
+    }
+
+    private func applyMaterialOverride(_ materialOverride: ModelMaterialOverride?) {
+        guard let materialOverride else { return }
+        for mesh in meshes {
+            for submesh in mesh.submeshes {
+                submesh.applyMaterialOverride(materialOverride)
             }
         }
     }

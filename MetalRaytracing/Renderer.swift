@@ -149,6 +149,28 @@ class Renderer: NSObject {
         }
     }
     
+    // Increase per-pixel samples when motion is high.
+    var useMotionAdaptiveSampling: Bool = true {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionSamplingMaxExtraSamples: Int32 = 2 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionSamplingLowThresholdPixels: Float = 1.0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var motionSamplingHighThresholdPixels: Float = 6.0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    
     
     // Max ray bounces (higher = more realistic lighting, slower)
     var maxBounces: Int32 = 2 {
@@ -631,6 +653,10 @@ class Renderer: NSObject {
         uniforms.pointee.motionAccumulationMinWeight = motionAccumulationMinWeight
         uniforms.pointee.motionAccumulationLowThresholdPixels = motionAccumulationLowThresholdPixels
         uniforms.pointee.motionAccumulationHighThresholdPixels = motionAccumulationHighThresholdPixels
+        uniforms.pointee.enableMotionAdaptiveSampling = useMotionAdaptiveSampling ? 1 : 0
+        uniforms.pointee.motionSamplingMaxExtraSamples = motionSamplingMaxExtraSamples
+        uniforms.pointee.motionSamplingLowThresholdPixels = motionSamplingLowThresholdPixels
+        uniforms.pointee.motionSamplingHighThresholdPixels = motionSamplingHighThresholdPixels
         frameIndex += 1
         
         // Save current camera for next frame
@@ -656,7 +682,7 @@ class Renderer: NSObject {
         
         let desiredScale = clampedRenderScale()
         let inputSize = scaledSize(for: outputSize, scale: desiredScale)
-        let colorFormat: MTLPixelFormat = .rgba32Float
+        let colorFormat: MTLPixelFormat = .rgba16Float
         
         let inputWidth = Int(inputSize.width)
         let inputHeight = Int(inputSize.height)

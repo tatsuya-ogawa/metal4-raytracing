@@ -13,7 +13,12 @@ class AppScene: Scene {
         
         self.models = [
             Model(name: "robot", position: [-0.5, 0.0, 1.0], rotation: [0, 0, 0], scale: 0.01, on: device),
-            Model(name: "dragon", position: [0.3, 0.38, 2.5], rotation: [0, .pi / 2 * 1.2, 0], scale: 1.2, on: device),
+            Model(name: "dragon",
+                  position: [0.3, 0.38, 2.5],
+                  rotation: [0, .pi / 2 * 1.2, 0],
+                  scale: 1.2,
+                  materialOverride: .glass(),
+                  on: device),
             Model(name: "train", position: [-0.3, 0, 0.4], scale: 0.5, on: device),
             Model(name: "treefir", position: [0.5, 0, -0.2], scale: 0.7, on: device),
             Model(name: "plane", position: [0, 0, 0], scale: 10, on: device),

@@ -64,6 +64,7 @@ class Renderer: NSObject {
     private var specularAlbedoTexture: MTLTexture?
     private var normalTexture: MTLTexture?
     private var roughnessTexture: MTLTexture?
+    private var causticReservoirTargets: [MTLTexture] = []
     private var metal4Compiler: MTL4Compiler?
     
     var framePresenter: FramePresenter!
@@ -186,6 +187,28 @@ class Renderer: NSObject {
     }
     
     var shadingMode: ShadingMode = .pbr {
+        didSet {
+            frameIndex = 0
+        }
+    }
+
+    // Fast refractive-caustics approximation (speed-first).
+    var enableRealtimeCaustics: Bool = true {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var causticStrength: Float = 6.0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var causticFocusPower: Float = 18.0 {
+        didSet {
+            frameIndex = 0
+        }
+    }
+    var causticMaxInteractions: Int32 = 3 {
         didSet {
             frameIndex = 0
         }
@@ -657,6 +680,10 @@ class Renderer: NSObject {
         uniforms.pointee.motionSamplingMaxExtraSamples = motionSamplingMaxExtraSamples
         uniforms.pointee.motionSamplingLowThresholdPixels = motionSamplingLowThresholdPixels
         uniforms.pointee.motionSamplingHighThresholdPixels = motionSamplingHighThresholdPixels
+        uniforms.pointee.enableRealtimeCaustics = enableRealtimeCaustics ? 1 : 0
+        uniforms.pointee.causticStrength = max(causticStrength, 0.0)
+        uniforms.pointee.causticFocusPower = max(causticFocusPower, 1.0)
+        uniforms.pointee.causticMaxInteractions = max(1, min(causticMaxInteractions, 8))
         frameIndex += 1
         
         // Save current camera for next frame
@@ -797,6 +824,20 @@ class Renderer: NSObject {
         roughnessDescriptor.usage = [.shaderRead, .shaderWrite]
         roughnessTexture = device.makeTexture(descriptor: roughnessDescriptor)
         roughnessTexture?.label = "Roughness Texture"
+
+        let causticReservoirDescriptor = MTLTextureDescriptor()
+        causticReservoirDescriptor.pixelFormat = .rgba16Float
+        causticReservoirDescriptor.textureType = .type2D
+        causticReservoirDescriptor.width = inputWidth
+        causticReservoirDescriptor.height = inputHeight
+        causticReservoirDescriptor.storageMode = .private
+        causticReservoirDescriptor.usage = [.shaderRead, .shaderWrite]
+        causticReservoirTargets = [
+            device.makeTexture(descriptor: causticReservoirDescriptor)!,
+            device.makeTexture(descriptor: causticReservoirDescriptor)!
+        ]
+        causticReservoirTargets[0].label = "Caustic Reservoir Texture 1"
+        causticReservoirTargets[1].label = "Caustic Reservoir Texture 2"
         
         lastDrawableSize = outputSize
         framePresenter.createTextures(outputSize: outputSize, colorFormat: colorFormat, renderSize: inputSize, accumulationTargets: accumulationTargets)
@@ -840,6 +881,9 @@ class Renderer: NSObject {
         }
         if let roughnessTexture {
             allocations.append(roughnessTexture)
+        }
+        for texture in causticReservoirTargets {
+            allocations.append(texture)
         }
         for texture in accumulationTargets {
             allocations.append(texture)
@@ -1484,6 +1528,10 @@ extension Renderer: MTKViewDelegate {
         if let roughnessTexture = roughnessTexture {
             computeTable.setTexture(roughnessTexture.gpuResourceID, index: TextureIndex.roughness.rawValue)
         }
+        if causticReservoirTargets.count >= 2 {
+            computeTable.setTexture(causticReservoirTargets[1].gpuResourceID, index: TextureIndex.causticReservoir.rawValue)
+            computeTable.setTexture(causticReservoirTargets[0].gpuResourceID, index: TextureIndex.previousCausticReservoir.rawValue)
+        }
         
         computeEncoder.setArgumentTable(computeTable)
         computeEncoder.dispatchThreadgroups(threadgroupsPerGrid: threadGroups, threadsPerThreadgroup: threadsPerGroup)
@@ -1492,6 +1540,11 @@ extension Renderer: MTKViewDelegate {
         let tmp = accumulationTargets[0]
         accumulationTargets[0] = accumulationTargets[1]
         accumulationTargets[1] = tmp
+        if causticReservoirTargets.count >= 2 {
+            let tmpReservoir = causticReservoirTargets[0]
+            causticReservoirTargets[0] = causticReservoirTargets[1]
+            causticReservoirTargets[1] = tmpReservoir
+        }
         
         if let residencySet = commandQueueResidencySet {
             commandBuffer.useResidencySet(residencySet)

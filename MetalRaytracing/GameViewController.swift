@@ -175,7 +175,7 @@ class GameViewController: NSViewController {
         debugLabel.font = NSFont.systemFont(ofSize: 12)
         
         let debugPopup = NSPopUpButton()
-        debugPopup.addItems(withTitles: ["None", "Base Color", "Normal", "Roughness", "Metallic", "AO", "Emission", "Motion"])
+        debugPopup.addItems(withTitles: ["None", "Base Color", "Normal", "Roughness", "Metallic", "AO", "Emission", "Motion", "Caustic Reservoir"])
         debugPopup.selectItem(at: 0)
         debugPopup.target = self
         debugPopup.action = #selector(debugTextureChanged(_:))
@@ -773,7 +773,7 @@ class GameViewController: UIViewController {
         debugButton.contentEdgeInsets = UIEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
         debugButton.showsMenuAsPrimaryAction = true
         
-        let debugTitles = ["None", "Base Color", "Normal", "Roughness", "Metallic", "AO", "Emission", "Motion"]
+        let debugTitles = ["None", "Base Color", "Normal", "Roughness", "Metallic", "AO", "Emission", "Motion", "Caustic Reservoir"]
         let debugActions = debugTitles.enumerated().map { index, title in
             UIAction(title: title, state: index == 0 ? .on : .off) { [weak self] _ in
                 guard let self = self else { return }

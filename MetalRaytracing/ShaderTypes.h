@@ -66,7 +66,9 @@ typedef NS_ENUM(NSInteger, TextureIndex) {
   TextureIndexDiffuseAlbedo = 5,
   TextureIndexSpecularAlbedo = 6,
   TextureIndexNormal = 7,
-  TextureIndexRoughness = 8
+  TextureIndexRoughness = 8,
+  TextureIndexCausticReservoir = 9,
+  TextureIndexPreviousCausticReservoir = 10
 };
 
 typedef NS_ENUM(NSInteger, VertexAttribute) {
@@ -127,6 +129,10 @@ struct Uniforms {
   int motionSamplingMaxExtraSamples;
   float motionSamplingLowThresholdPixels;
   float motionSamplingHighThresholdPixels;
+  int enableRealtimeCaustics;
+  float causticStrength;
+  float causticFocusPower;
+  int causticMaxInteractions;
 };
 
 typedef NS_ENUM(NSInteger, ShadingMode) {
@@ -164,7 +170,8 @@ typedef NS_ENUM(NSInteger, DebugTextureMode) {
   DebugTextureModeMetallic = 4,
   DebugTextureModeAO = 5,
   DebugTextureModeEmission = 6,
-  DebugTextureModeMotion = 7
+  DebugTextureModeMotion = 7,
+  DebugTextureModeCausticReservoir = 8
 };
 
 #endif /* ShaderTypes_h */

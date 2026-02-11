@@ -95,6 +95,7 @@ inline float3 sampleCosineWeightedHemisphere(float2 u) {
 inline void sampleAreaLight(device Light & light,
                             float2 u,
                             float3 position,
+                            thread float3 & lightSamplePosition,
                             thread float3 & lightDirection,
                             thread float3 & lightColor,
                             thread float & lightDistance)
@@ -106,6 +107,7 @@ inline void sampleAreaLight(device Light & light,
     float3 samplePosition = light.position +
     light.right * u.x +
     light.up * u.y;
+    lightSamplePosition = samplePosition;
     
     // Compute vector from sample point on light source to intersection point
     lightDirection = samplePosition - position;
@@ -165,6 +167,10 @@ inline float3 fresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (1.0f - F0) * pow(clamp(1.0f - cosTheta, 0.0f, 1.0f), 5.0f);
 }
 
+inline float luminance(float3 color) {
+    return dot(color, float3(0.2126f, 0.7152f, 0.0722f));
+}
+
 struct Resource
 {
     device float3 *positions [[id(0)]];
@@ -217,6 +223,136 @@ inline bool computeTangentBasis(device float3 *positions,
     return (length(tangent) > 1e-8f) && (length(bitangent) > 1e-8f);
 }
 
+inline float estimateRefractiveCausticVisibility(acceleration_structure<instancing> accelerationStructure,
+                                                 device Resource *resources,
+                                                 device MTLIndirectAccelerationStructureInstanceDescriptor *instances,
+                                                 ray initialShadowRay,
+                                                 float3 lightSamplePosition,
+                                                 float lightDistance,
+                                                 int maxInteractions,
+                                                 float focusPower)
+{
+    constexpr sampler opacitySampler(min_filter::linear, mag_filter::linear, mip_filter::linear, address::repeat);
+
+    intersector<triangle_data, instancing> causticIntersector;
+    causticIntersector.assume_geometry_type(geometry_type::triangle);
+    causticIntersector.force_opacity(forced_opacity::opaque);
+    causticIntersector.accept_any_intersection(false);
+
+    ray causticRay = initialShadowRay;
+    causticRay.min_distance = 0.0f;
+    causticRay.max_distance = max(lightDistance - 1e-3f, 1e-3f);
+
+    float transmissionWeight = 1.0f;
+    float focusWeight = 1.0f;
+    bool crossedRefractive = false;
+    int safeInteractionCount = max(1, min(maxInteractions, 8));
+    float safeFocusPower = clamp(focusPower, 1.0f, 64.0f);
+
+    for (int interaction = 0; interaction < safeInteractionCount; interaction++) {
+        typename intersector<triangle_data, instancing>::result_type hit = causticIntersector.intersect(causticRay, accelerationStructure);
+        if (hit.type == intersection_type::none) {
+            if (!crossedRefractive) {
+                return 0.0f;
+            }
+            return clamp(transmissionWeight * focusWeight, 0.0f, 8.0f);
+        }
+
+        int resourceIndex = hit.instance_id * maxSubmeshes + hit.geometry_id;
+        Resource hitResource = resources[resourceIndex];
+
+        float opacity = clamp(hitResource.material->opacity, 0.0f, 1.0f);
+        bool hasOpacityMap = (hitResource.material->textureFlags & MATERIAL_TEXTURE_OPACITY) != 0;
+        if (hasOpacityMap) {
+            float2 uv = interpolateVertexAttribute(hitResource.uvs, hit, hitResource.indices);
+            uv.y = 1.0f - uv.y;
+            opacity *= hitResource.opacityMap.sample(opacitySampler, uv).x;
+            opacity = clamp(opacity, 0.0f, 1.0f);
+        }
+
+        float ior = max(hitResource.material->refractionIndex, 1.0f);
+        float transmission = 1.0f - opacity;
+        bool isTransmissive = (transmission > 0.01f) || (ior > 1.01f && opacity < 0.999f);
+        if (!isTransmissive) {
+            return 0.0f;
+        }
+        crossedRefractive = true;
+
+        float4x4 objectToWorldSpaceTransform(1.0f);
+        for (int column = 0; column < 4; column++) {
+            for (int row = 0; row < 3; row++) {
+                objectToWorldSpaceTransform[column][row] = instances[hit.instance_id].transformationMatrix[column][row];
+            }
+        }
+
+        float3 hitPoint = causticRay.origin + causticRay.direction * hit.distance;
+        float3 objectSpaceNormal = interpolateVertexAttribute(hitResource.normals, hit, hitResource.indices);
+        float3 surfaceNormal = normalize((objectToWorldSpaceTransform * float4(objectSpaceNormal, 0.0f)).xyz);
+        if (length(objectSpaceNormal) < 1e-8f) {
+            surfaceNormal = -causticRay.direction;
+        }
+
+        float3 N = surfaceNormal;
+        float3 I = causticRay.direction;
+        float cosi = clamp(dot(-I, N), -1.0f, 1.0f);
+        float etaI = 1.0f;
+        float etaT = ior;
+        if (cosi < 0.0f) {
+            cosi = -cosi;
+            N = -N;
+            float tmp = etaI;
+            etaI = etaT;
+            etaT = tmp;
+        }
+
+        float eta = etaI / etaT;
+        float k = 1.0f - eta * eta * (1.0f - cosi * cosi);
+        float f0 = (etaT - etaI) / (etaT + etaI);
+        f0 = f0 * f0;
+        float fresnel = f0 + (1.0f - f0) * pow(clamp(1.0f - cosi, 0.0f, 1.0f), 5.0f);
+
+        float3 nextDirection;
+        if (k < 0.0f) {
+            nextDirection = normalize(I - 2.0f * dot(I, N) * N);
+            transmissionWeight *= max(fresnel, 0.1f);
+        } else {
+            float cosT = sqrt(max(k, 0.0f));
+            nextDirection = normalize(eta * I + (eta * cosi - cosT) * N);
+            transmissionWeight *= (1.0f - fresnel) * max(transmission, 0.05f);
+
+            float3 toLight = normalize(lightSamplePosition - hitPoint);
+            float alignment = saturate(dot(nextDirection, toLight));
+            float bend = length(nextDirection - I);
+            float focusGain = pow(max(alignment, 1e-3f), safeFocusPower);
+            focusGain *= (1.0f + bend * 4.0f * max(ior - 1.0f, 0.0f));
+            focusWeight *= clamp(focusGain, 0.25f, 3.0f);
+        }
+
+        if (transmissionWeight < 1e-4f) {
+            return 0.0f;
+        }
+
+        causticRay.origin = hitPoint + nextDirection * 1e-3f;
+        causticRay.direction = nextDirection;
+
+        float3 toLight = lightSamplePosition - causticRay.origin;
+        float remainingDistance = length(toLight);
+        if (remainingDistance < 1e-3f) {
+            return clamp(transmissionWeight * focusWeight, 0.0f, 8.0f);
+        }
+
+        float3 toLightDir = toLight / remainingDistance;
+        float travelAlignment = dot(causticRay.direction, toLightDir);
+        if (travelAlignment < 0.2f) {
+            return 0.0f;
+        }
+
+        causticRay.max_distance = max(remainingDistance - 1e-3f, 1e-3f);
+    }
+
+    return 0.0f;
+}
+
 [[max_total_threads_per_threadgroup(256)]]
 kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                              constant Uniforms & uniforms [[ buffer(BufferIndexUniforms) ]],
@@ -233,7 +369,9 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                              texture2d<float, access::write> diffuseAlbedoTex [[ texture(TextureIndexDiffuseAlbedo) ]],
                              texture2d<float, access::write> specularAlbedoTex [[ texture(TextureIndexSpecularAlbedo) ]],
                              texture2d<float, access::write> normalTex [[ texture(TextureIndexNormal) ]],
-                             texture2d<float, access::write> roughnessTex [[ texture(TextureIndexRoughness) ]])
+                             texture2d<float, access::write> roughnessTex [[ texture(TextureIndexRoughness) ]],
+                             texture2d<float, access::write> causticReservoirTex [[ texture(TextureIndexCausticReservoir) ]],
+                             texture2d<float, access::read> prevCausticReservoirTex [[ texture(TextureIndexPreviousCausticReservoir) ]])
 {
     // The sample aligns the thread count to the threadgroup size. which means the thread count
     // may be different than the bounds of the texture. Test to make sure this thread
@@ -246,6 +384,8 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         
         float3 totalColor = float3(0.0f);
         float2 prevMotion = motionTex.read(tid).xy;
+        float4 prevCausticReservoir = prevCausticReservoirTex.read(tid);
+        bool showCausticReservoirDebug = (uniforms.debugTextureMode == DebugTextureModeCausticReservoir);
         
         // For temporal scaler: track first hit for depth and motion
         // Initialize depth to "far" so miss pixels don't look like near hits.
@@ -259,6 +399,12 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         float4 outNormal = float4(0.0f);
         float4 outRoughness = float4(0.0f);
         bool wroteGBuffer = false;
+        float4 outCausticReservoir = prevCausticReservoir;
+        outCausticReservoir.w = max(outCausticReservoir.w * 0.985f, 0.0f);
+        if (uniforms.frameIndex == 0) {
+            outCausticReservoir = float4(0.0f, 0.0f, -1.0f, 0.0f);
+        }
+        bool wroteCausticReservoir = false;
         
         int baseSamples = max(uniforms.samplesPerPixel, 1);
         int maxExtraSamples = (uniforms.enableMotionAdaptiveSampling != 0) ? max(uniforms.motionSamplingMaxExtraSamples, 0) : 0;
@@ -456,7 +602,7 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             }
             
             // Debug Visualization
-            if (uniforms.debugTextureMode != DebugTextureModeNone) {
+            if (uniforms.debugTextureMode != DebugTextureModeNone && !showCausticReservoirDebug) {
                 float3 debugColor = float3(0.0f);
                 if (uniforms.debugTextureMode == DebugTextureModeBaseColor) {
                     debugColor = hasBaseColorMap ? baseColorSample.rgb : float3(1.0f, 0.0f, 1.0f); // Magenta if missing
@@ -586,28 +732,109 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
             
             // Choose a random light source to sample.
             float lightSample = halton(offset + frameOffset, 2 + step * 6 + 0);
-            int lightIndex = min((int)(lightSample * uniforms.lightCount), uniforms.lightCount - 1);
-            
-            device Light &light = lights[lightIndex];
+            int sampledLightIndex = min((int)(lightSample * uniforms.lightCount), uniforms.lightCount - 1);
+            float2 areaLightSampleUV = float2(0.5f);
+            float areaReservoirImportance = 0.0f;
+            bool sampledAreaLight = false;
             
             float3 worldSpaceLightDirection;
             float lightDistance;
             float3 lightColor;
+            float3 lightSamplePosition = worldSpaceIntersectionPoint;
+            bool lightHasFiniteDistance = true;
+            device Light &initialLight = lights[sampledLightIndex];
             
-            if (light.type == LightTypeAreaLight) {
+            if (initialLight.type == LightTypeAreaLight) {
+                sampledAreaLight = true;
                 
-                // Choose a random point to sample on the light source.
-                r = float2(halton(offset + frameOffset, 2 + step * 6 + 1),
-                                  halton(offset + frameOffset, 2 + step * 6 + 2));
+                // Candidate 1: random light point on the selected area light.
+                float2 randomAreaUV = float2(halton(offset + frameOffset, 2 + step * 6 + 1),
+                                             halton(offset + frameOffset, 2 + step * 6 + 2));
+                float3 randomSamplePosition;
+                float3 randomDirection;
+                float3 randomColor;
+                float randomDistance;
+                sampleAreaLight(initialLight, randomAreaUV, worldSpaceIntersectionPoint, randomSamplePosition, randomDirection,
+                                randomColor, randomDistance);
+                float randomNdotL = saturate(dot(shadingNormal, normalize(randomDirection)));
+                float randomImportance = randomNdotL * luminance(randomColor);
+                
+                int selectedLightIndex = sampledLightIndex;
+                float2 selectedAreaUV = randomAreaUV;
+                float3 selectedSamplePosition = randomSamplePosition;
+                float3 selectedDirection = randomDirection;
+                float3 selectedColor = randomColor;
+                float selectedDistance = randomDistance;
+                float selectedImportance = randomImportance;
+                float reservoirWeightSum = max(randomImportance, 0.0f);
+                
+                // Candidate 2+: spatio-temporal reuse from previous frame reservoir (ReSTIR-like).
+                if (uniforms.enableRealtimeCaustics != 0 && uniforms.frameIndex > 0) {
+                    int2 reprojectionPixel = int2(round(float2(tid) - prevMotion));
+                    const int2 temporalOffsets[5] = {
+                        int2(0, 0),
+                        int2(1, 0),
+                        int2(-1, 0),
+                        int2(0, 1),
+                        int2(0, -1)
+                    };
+                    for (int candidateIndex = 0; candidateIndex < 5; candidateIndex++) {
+                        int2 prevPixel = reprojectionPixel + temporalOffsets[candidateIndex];
+                        prevPixel = clamp(prevPixel, int2(0), int2(uniforms.width - 1, uniforms.height - 1));
+                        float4 previousReservoir = prevCausticReservoirTex.read(uint2(prevPixel));
+                        if (previousReservoir.w <= 1e-5f) {
+                            continue;
+                        }
 
-                // Sample the lighting between the intersection point and the point on the area light.
-                sampleAreaLight(light, r, worldSpaceIntersectionPoint, worldSpaceLightDirection,
-                                lightColor, lightDistance);
+                        int temporalLightIndex = (int)round(previousReservoir.z);
+                        if (temporalLightIndex < 0 || temporalLightIndex >= uniforms.lightCount) {
+                            continue;
+                        }
+
+                        device Light &temporalLight = lights[temporalLightIndex];
+                        if (temporalLight.type != LightTypeAreaLight) {
+                            continue;
+                        }
+
+                        float2 temporalAreaUV = clamp(previousReservoir.xy, 0.0f, 1.0f);
+                        float3 temporalSamplePosition;
+                        float3 temporalDirection;
+                        float3 temporalColor;
+                        float temporalDistance;
+                        sampleAreaLight(temporalLight, temporalAreaUV, worldSpaceIntersectionPoint, temporalSamplePosition,
+                                        temporalDirection, temporalColor, temporalDistance);
+                        float temporalNdotL = saturate(dot(shadingNormal, normalize(temporalDirection)));
+                        float temporalImportance = temporalNdotL * luminance(temporalColor);
+                        temporalImportance *= (1.0f + clamp(previousReservoir.w * 0.1f, 0.0f, 2.0f));
+                        if (temporalImportance <= 1e-6f) {
+                            continue;
+                        }
+
+                        reservoirWeightSum += temporalImportance;
+                        float chooseTemporal = halton(offset + frameOffset, 2 + step * 6 + 6 + candidateIndex);
+                        if (chooseTemporal < (temporalImportance / max(reservoirWeightSum, 1e-6f))) {
+                            selectedLightIndex = temporalLightIndex;
+                            selectedAreaUV = temporalAreaUV;
+                            selectedSamplePosition = temporalSamplePosition;
+                            selectedDirection = temporalDirection;
+                            selectedColor = temporalColor;
+                            selectedDistance = temporalDistance;
+                            selectedImportance = temporalImportance;
+                        }
+                    }
+                }
                 
-                
-            } else if (light.type == LightTypeSpotlight) {
+                sampledLightIndex = selectedLightIndex;
+                areaLightSampleUV = selectedAreaUV;
+                areaReservoirImportance = max(reservoirWeightSum, selectedImportance);
+                lightSamplePosition = selectedSamplePosition;
+                worldSpaceLightDirection = selectedDirection;
+                lightColor = selectedColor;
+                lightDistance = selectedDistance;
+            } else if (initialLight.type == LightTypeSpotlight) {
                 // Compute vector from sample point on light source to intersection point
-                worldSpaceLightDirection = light.position - worldSpaceIntersectionPoint;
+                worldSpaceLightDirection = initialLight.position - worldSpaceIntersectionPoint;
+                lightSamplePosition = initialLight.position;
                         
                 lightDistance = length(worldSpaceLightDirection);
                 
@@ -617,34 +844,43 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 worldSpaceLightDirection *= inverseLightDistance;
                 
 //                // Start with the light's color
-//                lightColor = light.color;
+//                lightColor = initialLight.color;
 //
 //                // Light falls off with the inverse square of the distance to the intersection point
 //                lightColor *= (inverseLightDistance * inverseLightDistance);
                 
                 lightColor = 0.0;
                 
-                float3 coneDirection = normalize(light.direction);
+                float3 coneDirection = normalize(initialLight.direction);
                 float spotResult = dot(-worldSpaceLightDirection, coneDirection);
                 
-                if (spotResult > cos(light.coneAngle)) {
-                    lightColor = light.color * inverseLightDistance * inverseLightDistance;
+                if (spotResult > cos(initialLight.coneAngle)) {
+                    lightColor = initialLight.color * inverseLightDistance * inverseLightDistance;
                 }
-            } else if (light.type == LightTypePointlight) {
-                worldSpaceLightDirection = light.position - worldSpaceIntersectionPoint;
+            } else if (initialLight.type == LightTypePointlight) {
+                worldSpaceLightDirection = initialLight.position - worldSpaceIntersectionPoint;
+                lightSamplePosition = initialLight.position;
                 lightDistance = length(worldSpaceLightDirection);
                 float inverseLightDistance = 1.0f / max(lightDistance, 1e-3f);
                 worldSpaceLightDirection *= inverseLightDistance;
-                lightColor = light.color * inverseLightDistance * inverseLightDistance;
+                lightColor = initialLight.color * inverseLightDistance * inverseLightDistance;
             } else  { // light.type == LightTypeSunlight
-                worldSpaceLightDirection = -normalize(light.direction);
+                worldSpaceLightDirection = -normalize(initialLight.direction);
                 lightDistance = INFINITY;
-                lightColor = light.color;
+                lightColor = initialLight.color;
+                lightHasFiniteDistance = false;
             }
             
             // Scale the light color by the number of lights to compensate for the fact that
             // the sample only samples one light source at random.
             lightColor *= uniforms.lightCount;
+
+            bool shouldStoreCausticReservoir = sampledAreaLight &&
+                                               uniforms.enableRealtimeCaustics != 0 &&
+                                               !wroteCausticReservoir &&
+                                               sampleIndex == 0 &&
+                                               bounce == 0;
+            float pendingReservoirWeight = max(areaReservoirImportance * 0.02f, 1e-4f);
 
             if (uniforms.shadingMode == ShadingModeLegacy) {
                 float3 L = normalize(worldSpaceLightDirection);
@@ -709,38 +945,65 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 float3 diffuse = kD * diffuseColor / M_PI_F;
                 
                 float3 direct = (diffuse + specular) * lightColor * NdotL;
-            
-                // Compute the shadow ray. The shadow ray checks if the sample position on the
-                // light source is visible from the current intersection point.
-                // If it is, the lighting contribution is added to the output image.
-                struct ray shadowRay;
+                
+                if (NdotL > 0.0f) {
+                    // Compute the shadow ray. The shadow ray checks if the sample position on the
+                    // light source is visible from the current intersection point.
+                    struct ray shadowRay;
 
-                // Add a small offset to the intersection point to avoid intersecting the same
-                // triangle again.
-                shadowRay.origin = worldSpaceIntersectionPoint + worldSpaceSurfaceNormal * 1e-3f;
+                    // Add a small offset to the intersection point to avoid intersecting the same
+                    // triangle again.
+                    shadowRay.origin = worldSpaceIntersectionPoint + worldSpaceSurfaceNormal * 1e-3f;
 
-                // Travel towards the light source.
-                shadowRay.direction = worldSpaceLightDirection;
+                    // Travel towards the light source.
+                    shadowRay.direction = worldSpaceLightDirection;
 
-                // Don't overshoot the light source.
-                shadowRay.max_distance = lightDistance - 1e-3f;
+                    // Don't overshoot the light source.
+                    shadowRay.max_distance = lightDistance - 1e-3f;
 
-                // Shadow rays check only whether there is an object between the intersection point
-                // and the light source. Tell Metal to return after finding any intersection.
-                i.accept_any_intersection(true);
+                    // Shadow rays check only whether there is an object between the intersection point
+                    // and the light source. Tell Metal to return after finding any intersection.
+                    i.accept_any_intersection(true);
 
-                /*if (useIntersectionFunctions)
-                    intersection = i.intersect(shadowRay, accelerationStructure, RAY_MASK_SHADOW, intersectionFunctionTable);
-                else
-                    intersection = i.intersect(shadowRay, accelerationStructure, RAY_MASK_SHADOW);
-                 */
-                intersection = i.intersect(shadowRay, accelerationStructure);
+                    /*if (useIntersectionFunctions)
+                        intersection = i.intersect(shadowRay, accelerationStructure, RAY_MASK_SHADOW, intersectionFunctionTable);
+                    else
+                        intersection = i.intersect(shadowRay, accelerationStructure, RAY_MASK_SHADOW);
+                     */
+                    intersection = i.intersect(shadowRay, accelerationStructure);
 
-                // If there was no intersection, then the light source is visible from the original
-                // intersection  point. Add the light's contribution to the image.
-                if (intersection.type == intersection_type::none) {
-                    accumulatedColor += color * direct;
+                    // If there was no intersection, then the light source is visible from the original
+                    // intersection point. Add the light's contribution to the image.
+                    if (intersection.type == intersection_type::none) {
+                        accumulatedColor += color * direct;
+                    } else if (uniforms.enableRealtimeCaustics != 0 &&
+                               uniforms.causticStrength > 0.0f &&
+                               lightHasFiniteDistance) {
+                        float causticVisibility = estimateRefractiveCausticVisibility(accelerationStructure,
+                                                                                       resources,
+                                                                                       instances,
+                                                                                       shadowRay,
+                                                                                       lightSamplePosition,
+                                                                                       lightDistance,
+                                                                                       uniforms.causticMaxInteractions,
+                                                                                       uniforms.causticFocusPower);
+                        if (causticVisibility > 0.0f) {
+                            float causticWeight = clamp(uniforms.causticStrength * causticVisibility, 0.0f, 8.0f);
+                            accumulatedColor += color * direct * causticWeight;
+                            if (shouldStoreCausticReservoir) {
+                                float causticSignal = luminance(direct) * causticVisibility;
+                                pendingReservoirWeight = max(pendingReservoirWeight, causticSignal * 16.0f);
+                            }
+                        }
+                    }
                 }
+            }
+
+            if (shouldStoreCausticReservoir && pendingReservoirWeight > 1e-5f) {
+                outCausticReservoir = float4(clamp(areaLightSampleUV, 0.0f, 1.0f),
+                                             float(sampledLightIndex),
+                                             clamp(pendingReservoirWeight, 1e-4f, 65504.0f));
+                wroteCausticReservoir = true;
             }
 
             // Update throughput for next bounce (diffuse only)
@@ -791,9 +1054,15 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
     
     // Average all samples
     totalColor /= float(max(totalSamples, 1));
+
+    if (showCausticReservoirDebug) {
+        float2 uvDebug = clamp(outCausticReservoir.xy, 0.0f, 1.0f);
+        float weightDebug = clamp(log2(1.0f + max(outCausticReservoir.w, 0.0f)) * 0.15f, 0.0f, 1.0f);
+        totalColor = float3(uvDebug, weightDebug);
+    }
                     
     // Average this frame's sample with all of the previous frames.
-    if (uniforms.frameIndex > 0) {
+    if (uniforms.frameIndex > 0 && !showCausticReservoirDebug) {
         float3 prevColor = prevTex.read(tid).xyz;
         float historyWeight = clamp(uniforms.accumulationWeight, 0.0f, 0.95f);
         if (uniforms.enableMotionAdaptiveAccumulation != 0) {
@@ -827,5 +1096,6 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         normalTex.write(outNormal, tid);
         roughnessTex.write(outRoughness, tid);
     }
+    causticReservoirTex.write(outCausticReservoir, tid);
     }
 }

@@ -18,6 +18,7 @@ class GameViewController: NSViewController {
     private var upscalerControl: NSSegmentedControl?
     private var scaleControl: NSPopUpButton?
     private var viewModeControl: NSSegmentedControl?
+    private var animationToggleButton: NSButton?
     var playerModelIndex: Int = 0
 
     override func viewDidLoad() {
@@ -193,12 +194,19 @@ class GameViewController: NSViewController {
         
         let lightSlider = NSSlider(value: 4.0, minValue: 0.0, maxValue: 50.0, target: self, action: #selector(lightIntensityChanged(_:)))
         lightSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
+
+        let animationLabel = NSTextField(labelWithString: "Animation:")
+        animationLabel.font = NSFont.systemFont(ofSize: 12)
+
+        let animationButton = NSButton(title: "Stop Animation", target: self, action: #selector(toggleAnimation(_:)))
+        animationButton.bezelStyle = .rounded
+        animationToggleButton = animationButton
         
         let hint = NSTextField(labelWithString: "Drag: Orbit  Pinch: Zoom  M: Toggle MetalFX")
         hint.font = NSFont.systemFont(ofSize: 11)
         hint.textColor = NSColor.secondaryLabelColor
         
-        let stack = NSStackView(views: [title, popup, modeLabel, modeSegment, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
+        let stack = NSStackView(views: [title, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
         stack.orientation = .vertical
         stack.spacing = 6
         stack.alignment = .leading
@@ -216,6 +224,8 @@ class GameViewController: NSViewController {
             container.leadingAnchor.constraint(equalTo: mtkView.leadingAnchor, constant: 12),
             container.topAnchor.constraint(equalTo: mtkView.topAnchor, constant: 12)
         ])
+
+        updateAnimationButtonTitle()
     }
     
     @objc private func viewPresetChanged(_ sender: NSPopUpButton) {
@@ -318,6 +328,12 @@ class GameViewController: NSViewController {
         renderer.setLightIntensity(sender.floatValue)
     }
 
+    @objc private func toggleAnimation(_ sender: NSButton) {
+        guard let renderer = renderer else { return }
+        renderer.isAnimationPaused.toggle()
+        updateAnimationButtonTitle()
+    }
+
     @objc private func accumulationChanged(_ sender: NSSlider) {
         guard let renderer = renderer else { return }
         renderer.accumulationWeight = sender.floatValue
@@ -337,6 +353,10 @@ class GameViewController: NSViewController {
     
     @objc private func motionAccumulationHighChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationHighThresholdPixels = sender.floatValue
+    }
+
+    private func updateAnimationButtonTitle() {
+        animationToggleButton?.title = (renderer?.isAnimationPaused ?? false) ? "Resume Animation" : "Stop Animation"
     }
     
     
@@ -403,6 +423,7 @@ class GameViewController: UIViewController {
     private var upscalerControl: UISegmentedControl?
     private var scaleControl: UISegmentedControl?
     private var viewModeControl: UISegmentedControl?
+    private var animationToggleButton: UIButton?
     
     // UI Elements for visibility toggling
     private var controlsContainer: UIView?
@@ -711,6 +732,25 @@ class GameViewController: UIViewController {
         }
         lightContainer.addArrangedSubview(lightLabel)
         lightContainer.addArrangedSubview(lightSlider)
+
+        let animationContainer = UIStackView()
+        animationContainer.axis = .horizontal
+        animationContainer.spacing = 8
+        animationContainer.alignment = .center
+
+        let animationLabel = UILabel()
+        animationLabel.text = "Animation"
+        animationLabel.font = UIFont.systemFont(ofSize: 13)
+        animationLabel.textColor = .label
+
+        let animationButton = UIButton(type: .system)
+        animationButton.titleLabel?.font = UIFont.systemFont(ofSize: 13, weight: .semibold)
+        animationButton.contentEdgeInsets = UIEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        animationButton.addTarget(self, action: #selector(toggleAnimation(_:)), for: .touchUpInside)
+        animationToggleButton = animationButton
+
+        animationContainer.addArrangedSubview(animationLabel)
+        animationContainer.addArrangedSubview(animationButton)
         
         // Render scale control (for MetalFX)
         let scaleContainer = UIStackView()
@@ -804,7 +844,7 @@ class GameViewController: UIViewController {
         shadingContainer.addArrangedSubview(shadingLabel)
         shadingContainer.addArrangedSubview(shadingSegment)
 
-        let stack = UIStackView(arrangedSubviews: [title, button, modeContainer, debugContainer, shadingContainer, samplesContainer, accumulationContainer, bouncesContainer, lightContainer, upscalerContainer, scaleContainer, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
+        let stack = UIStackView(arrangedSubviews: [title, button, modeContainer, animationContainer, debugContainer, shadingContainer, samplesContainer, accumulationContainer, bouncesContainer, lightContainer, upscalerContainer, scaleContainer, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
         stack.axis = .vertical
         stack.spacing = 6
         stack.alignment = .leading
@@ -852,6 +892,8 @@ class GameViewController: UIViewController {
             fitHeight,
             maxHeight
         ])
+
+        updateAnimationButtonTitle()
     }
 
     @objc private func toggleControls(_ sender: UIButton) {
@@ -1043,6 +1085,12 @@ class GameViewController: UIViewController {
             renderer.shadingMode = mode
         }
     }
+
+    @objc private func toggleAnimation(_ sender: UIButton) {
+        guard let renderer = renderer else { return }
+        renderer.isAnimationPaused.toggle()
+        updateAnimationButtonTitle()
+    }
     
     @objc private func viewModeChanged(_ sender: UISegmentedControl) {
         guard let renderer = renderer else { return }
@@ -1074,6 +1122,11 @@ class GameViewController: UIViewController {
         renderer.zoom(delta: delta)
         gesture.scale = 1.0
         setViewPresetSelection(index: Renderer.ViewPreset.free.rawValue)
+    }
+
+    private func updateAnimationButtonTitle() {
+        let title = (renderer?.isAnimationPaused ?? false) ? "Resume" : "Stop"
+        animationToggleButton?.setTitle(title, for: .normal)
     }
     
     // MARK: - Virtual Joystick Implementation

@@ -190,6 +190,15 @@ class Renderer: NSObject {
             frameIndex = 0
         }
     }
+
+    var isAnimationPaused: Bool = false {
+        didSet {
+            if oldValue != isAnimationPaused {
+                skinningPass.setAnimationPaused(isAnimationPaused)
+                frameIndex = 0
+            }
+        }
+    }
     
     func setLightIntensity(_ intensity: Float) {
         scene.setLightIntensity(intensity)

@@ -31,6 +31,7 @@ class SkinningPass {
     // Throttle skinning/BLAS updates to a fixed interval.
     private let skinningDeltaTime: Double = 1.0 / 60.0
     private var lastSkinningUpdateTime: Double = 0
+    private(set) var isAnimationPaused = false
     
     init(device: MTLDevice, library: MTLLibrary) {
         self.device = device
@@ -284,10 +285,19 @@ class SkinningPass {
         dispatchSkinning(computeEncoder: computeEncoder, scene: scene)
         computeEncoder.endEncoding()
     }
+
+    func setAnimationPaused(_ paused: Bool) {
+        isAnimationPaused = paused
+        lastSkinningUpdateTime = CACurrentMediaTime()
+    }
     
     func updateSceneTimeAndAnimation(scene: Scene) -> Bool {
         // 1. Update Animation Time & Matrices
         let now = CACurrentMediaTime()
+        if isAnimationPaused {
+            lastSkinningUpdateTime = now
+            return true
+        }
         if lastSkinningUpdateTime == 0 {
             // Force an update on the first call.
             lastSkinningUpdateTime = now - skinningDeltaTime

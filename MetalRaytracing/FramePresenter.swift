@@ -3,6 +3,43 @@ import MetalKit
 import MetalFX
 import simd
 
+struct MetalFXTemporalFrameParameters {
+    var jitterOffsetX: Float = 0.0
+    var jitterOffsetY: Float = 0.0
+    var motionVectorScaleX: Float = 1.0
+    var motionVectorScaleY: Float = 1.0
+    var preExposure: Float = 1.0
+    var shouldResetHistory: Bool = false
+    var depthReversed: Bool = false
+    var worldToViewMatrix: matrix_float4x4 = matrix_identity_float4x4
+    var viewToClipMatrix: matrix_float4x4 = matrix_identity_float4x4
+}
+
+private func applyTemporalScalerParameters(to scaler: any MTLFXTemporalScalerBase,
+                                           parameters: MetalFXTemporalFrameParameters) {
+    scaler.jitterOffsetX = parameters.jitterOffsetX
+    scaler.jitterOffsetY = parameters.jitterOffsetY
+    scaler.motionVectorScaleX = parameters.motionVectorScaleX
+    scaler.motionVectorScaleY = parameters.motionVectorScaleY
+    scaler.preExposure = parameters.preExposure
+    scaler.reset = parameters.shouldResetHistory
+    scaler.isDepthReversed = parameters.depthReversed
+}
+
+@available(macOS 26.0, iOS 18.0, *)
+private func applyTemporalDenoisedScalerParameters(to scaler: any MTLFXTemporalDenoisedScalerBase,
+                                                   parameters: MetalFXTemporalFrameParameters) {
+    scaler.jitterOffsetX = parameters.jitterOffsetX
+    scaler.jitterOffsetY = parameters.jitterOffsetY
+    scaler.motionVectorScaleX = parameters.motionVectorScaleX
+    scaler.motionVectorScaleY = parameters.motionVectorScaleY
+    scaler.preExposure = parameters.preExposure
+    scaler.shouldResetHistory = parameters.shouldResetHistory
+    scaler.isDepthReversed = parameters.depthReversed
+    scaler.worldToViewMatrix = parameters.worldToViewMatrix
+    scaler.viewToClipMatrix = parameters.viewToClipMatrix
+}
+
 class LecacyUpScaleRenderer {
     let device: MTLDevice
     let legacyCommandQueue: MTLCommandQueue
@@ -71,6 +108,7 @@ class LecacyUpScaleRenderer {
         descriptor.outputHeight = outputHeight
         descriptor.isAutoExposureEnabled = false
         descriptor.isInputContentPropertiesEnabled = false
+        descriptor.isReactiveMaskTextureEnabled = false
         return descriptor.makeTemporalScaler(device: device)
     }
 
@@ -95,6 +133,10 @@ class LecacyUpScaleRenderer {
             descriptor.outputWidth = outputWidth
             descriptor.outputHeight = outputHeight
             descriptor.isAutoExposureEnabled = false
+            descriptor.isReactiveMaskTextureEnabled = false
+            descriptor.isSpecularHitDistanceTextureEnabled = false
+            descriptor.isDenoiseStrengthMaskTextureEnabled = false
+            descriptor.isTransparencyOverlayTextureEnabled = false
             return descriptor.makeTemporalDenoisedScaler(device: device)
         }
         return nil
@@ -170,7 +212,7 @@ class LecacyUpScaleRenderer {
         }
     }
     
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable) {
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, temporalFrameParameters: MetalFXTemporalFrameParameters, drawable: CAMetalDrawable) {
         guard let legacyCommandBuffer = legacyCommandQueue.makeCommandBuffer() else {
             return
         }
@@ -193,8 +235,7 @@ class LecacyUpScaleRenderer {
             temporalDenoisedScaler.normalTexture = normalTexture
             temporalDenoisedScaler.roughnessTexture = roughnessTexture
             temporalDenoisedScaler.outputTexture = upscaledTexture
-//            temporalDenoisedScaler.inputContentWidth = accumulationTargets[0].width
-//            temporalDenoisedScaler.inputContentHeight = accumulationTargets[0].height
+            applyTemporalDenoisedScalerParameters(to: temporalDenoisedScaler, parameters: temporalFrameParameters)
             temporalDenoisedScaler.encode(commandBuffer: legacyCommandBuffer)
         } else if let temporalScaler = temporalScaler,
            let upscaledTexture = upscaledTexture,
@@ -207,6 +248,7 @@ class LecacyUpScaleRenderer {
             temporalScaler.outputTexture = upscaledTexture
             temporalScaler.inputContentWidth = accumulationTargets[0].width
             temporalScaler.inputContentHeight = accumulationTargets[0].height
+            applyTemporalScalerParameters(to: temporalScaler, parameters: temporalFrameParameters)
             temporalScaler.encode(commandBuffer: legacyCommandBuffer)
         } else if let legacySpatialScaler = legacySpatialScaler,
                   let upscaledTexture = upscaledTexture,
@@ -333,6 +375,7 @@ class MTL4UpScaleRenderer {
         descriptor.outputHeight = outputHeight
         descriptor.isAutoExposureEnabled = false
         descriptor.isInputContentPropertiesEnabled = false
+        descriptor.isReactiveMaskTextureEnabled = false
         return descriptor.makeTemporalScaler(device: device, compiler: metal4Compiler)
     }
 
@@ -357,6 +400,10 @@ class MTL4UpScaleRenderer {
             descriptor.outputWidth = outputWidth
             descriptor.outputHeight = outputHeight
             descriptor.isAutoExposureEnabled = false
+            descriptor.isReactiveMaskTextureEnabled = false
+            descriptor.isSpecularHitDistanceTextureEnabled = false
+            descriptor.isDenoiseStrengthMaskTextureEnabled = false
+            descriptor.isTransparencyOverlayTextureEnabled = false
             return descriptor.makeTemporalDenoisedScaler(device: device, compiler: metal4Compiler)
         }
         return nil
@@ -432,7 +479,7 @@ class MTL4UpScaleRenderer {
         }
     }
     
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer passedCommandBuffer: MTL4CommandBuffer? = nil) {
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, temporalFrameParameters: MetalFXTemporalFrameParameters, drawable: CAMetalDrawable, commandBuffer passedCommandBuffer: MTL4CommandBuffer? = nil) {
         let commandBuffer: MTL4CommandBuffer
         if let passedCommandBuffer {
             commandBuffer = passedCommandBuffer
@@ -460,6 +507,7 @@ class MTL4UpScaleRenderer {
             temporalDenoisedScaler.normalTexture = normalTexture
             temporalDenoisedScaler.roughnessTexture = roughnessTexture
             temporalDenoisedScaler.outputTexture = upscaledTexture
+            applyTemporalDenoisedScalerParameters(to: temporalDenoisedScaler, parameters: temporalFrameParameters)
             // need fence otherwise "failed assertion `_outputTextureBarrierStages not set" raised
             temporalDenoisedScaler.fence = device.makeFence()
             temporalDenoisedScaler.encode(commandBuffer: commandBuffer)
@@ -474,6 +522,7 @@ class MTL4UpScaleRenderer {
             temporalScaler.outputTexture = upscaledTexture
             temporalScaler.inputContentWidth = accumulationTargets[0].width
             temporalScaler.inputContentHeight = accumulationTargets[0].height
+            applyTemporalScalerParameters(to: temporalScaler, parameters: temporalFrameParameters)
             // need fence otherwise "failed assertion `_outputTextureBarrierStages not set" raised
             temporalScaler.fence = device.makeFence()
             temporalScaler.encode(commandBuffer: commandBuffer)
@@ -542,6 +591,7 @@ protocol FramePresenter {
               specularAlbedoTexture: MTLTexture?,
               normalTexture: MTLTexture?,
               roughnessTexture: MTLTexture?,
+              temporalFrameParameters: MetalFXTemporalFrameParameters,
               drawable: CAMetalDrawable,
               commandBuffer: MTL4CommandBuffer)
 }
@@ -584,6 +634,7 @@ class LegacyFramePresenter: FramePresenter {
               specularAlbedoTexture: MTLTexture?,
               normalTexture: MTLTexture?,
               roughnessTexture: MTLTexture?,
+              temporalFrameParameters: MetalFXTemporalFrameParameters,
               drawable: CAMetalDrawable,
               commandBuffer: MTL4CommandBuffer) {
         
@@ -592,12 +643,12 @@ class LegacyFramePresenter: FramePresenter {
         commandQueue.commit([commandBuffer])
         commandQueue.signalEvent(computeEvent, value: gpuFrameIndex)
         
-        renderer.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable)
+        renderer.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, temporalFrameParameters: temporalFrameParameters, drawable: drawable)
     }
 }
 
 extension MTL4UpScaleRenderer: FramePresenter {
-    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, drawable: CAMetalDrawable, commandBuffer: MTL4CommandBuffer) {
-        self.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable, commandBuffer: commandBuffer as MTL4CommandBuffer?)
+    func draw(in view: MTKView, computeEvent: MTLEvent, gpuFrameIndex: UInt64, accumulationTargets: [MTLTexture], depthTexture: MTLTexture?, motionTexture: MTLTexture?, diffuseAlbedoTexture: MTLTexture?, specularAlbedoTexture: MTLTexture?, normalTexture: MTLTexture?, roughnessTexture: MTLTexture?, temporalFrameParameters: MetalFXTemporalFrameParameters, drawable: CAMetalDrawable, commandBuffer: MTL4CommandBuffer) {
+        self.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, temporalFrameParameters: temporalFrameParameters, drawable: drawable, commandBuffer: commandBuffer as MTL4CommandBuffer?)
     }
 }

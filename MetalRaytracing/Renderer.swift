@@ -681,6 +681,48 @@ class Renderer: NSObject {
         let height = max(1, Int(round(outputSize.height * CGFloat(scale))))
         return CGSize(width: width, height: height)
     }
+
+    private func makeMetalFXTemporalFrameParameters(camera: Camera,
+                                                    shouldResetHistory: Bool) -> MetalFXTemporalFrameParameters {
+        let rightScale = max(simd_length(camera.right), 1.0e-5)
+        let upScale = max(simd_length(camera.up), 1.0e-5)
+        let viewRight = camera.right / rightScale
+        let viewUp = camera.up / upScale
+        let viewForward = simd_normalize(camera.forward)
+
+        let worldToViewMatrix = matrix_float4x4(columns: (
+            SIMD4<Float>(viewRight.x, viewUp.x, viewForward.x, 0.0),
+            SIMD4<Float>(viewRight.y, viewUp.y, viewForward.y, 0.0),
+            SIMD4<Float>(viewRight.z, viewUp.z, viewForward.z, 0.0),
+            SIMD4<Float>(-simd_dot(viewRight, camera.position),
+                         -simd_dot(viewUp, camera.position),
+                         -simd_dot(viewForward, camera.position),
+                         1.0)
+        ))
+
+        let nearZ: Float = 0.01
+        let farZ: Float = 1_000.0
+        let clipZScale = farZ / (farZ - nearZ)
+        let clipZBias = -(nearZ * farZ) / (farZ - nearZ)
+        let viewToClipMatrix = matrix_float4x4(columns: (
+            SIMD4<Float>(1.0 / rightScale, 0.0, 0.0, 0.0),
+            SIMD4<Float>(0.0, 1.0 / upScale, 0.0, 0.0),
+            SIMD4<Float>(0.0, 0.0, clipZScale, 1.0),
+            SIMD4<Float>(0.0, 0.0, clipZBias, 0.0)
+        ))
+
+        return MetalFXTemporalFrameParameters(
+            jitterOffsetX: 0.0,
+            jitterOffsetY: 0.0,
+            motionVectorScaleX: 1.0,
+            motionVectorScaleY: 1.0,
+            preExposure: 1.0,
+            shouldResetHistory: shouldResetHistory,
+            depthReversed: false,
+            worldToViewMatrix: worldToViewMatrix,
+            viewToClipMatrix: viewToClipMatrix
+        )
+    }
     
     func createTextures(outputSize: CGSize) {
         let outputWidth = Int(outputSize.width)
@@ -1506,7 +1548,9 @@ extension Renderer: MTKViewDelegate {
             commandBuffer.useResidencySet(residencySet)
         }
         
-        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable, commandBuffer: commandBuffer)
+        let temporalFrameParameters = makeMetalFXTemporalFrameParameters(camera: scene.camera,
+                                                                         shouldResetHistory: frameIndex <= 1)
+        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, temporalFrameParameters: temporalFrameParameters, drawable: drawable, commandBuffer: commandBuffer)
         
         gpuFrameIndex += 1
     }

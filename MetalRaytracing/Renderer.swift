@@ -67,6 +67,7 @@ class Renderer: NSObject {
     private var metal4Compiler: MTL4Compiler?
     
     var framePresenter: FramePresenter!
+    private var currentTemporalDenoiserParameters = TemporalDenoiserParameters()
     
     // Temporal scaler toggle
     var useTemporalScaler: Bool = false {
@@ -233,6 +234,8 @@ class Renderer: NSObject {
     private let minCameraDistance: Float = 1.5
     private let maxCameraDistance: Float = 50.0
     private let cameraElevationLimit: Float = (Float.pi / 2.0) - 0.01
+    private let metalFXNearPlane: Float = 0.05
+    private let metalFXFarPlane: Float = 20.0
     
     init?(metalView: MTKView) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -643,6 +646,9 @@ class Renderer: NSObject {
         
         let pointer = uniformBuffer.contents().advanced(by: uniformBufferOffset)
         let uniforms = pointer.bindMemory(to: Uniforms.self, capacity: 1)
+        let currentFrameIndex = frameIndex
+        let worldToView = makeMetalFXWorldToViewMatrix(camera: scene.camera)
+        let viewToClip = makeMetalFXViewToClipMatrix(camera: scene.camera)
         
         uniforms.pointee.camera = scene.camera
         uniforms.pointee.previousCamera = previousCamera ?? scene.camera
@@ -650,7 +656,7 @@ class Renderer: NSObject {
         uniforms.pointee.width = Int32(size.width)
         uniforms.pointee.height = Int32(size.height)
         uniforms.pointee.blocksWide = ((uniforms.pointee.width) + 15) / 16
-        uniforms.pointee.frameIndex = frameIndex
+        uniforms.pointee.frameIndex = currentFrameIndex
         uniforms.pointee.samplesPerPixel = samplesPerPixel
         uniforms.pointee.samplesPerPixel = samplesPerPixel
         uniforms.pointee.maxBounces = maxBounces
@@ -666,10 +672,49 @@ class Renderer: NSObject {
         uniforms.pointee.motionSamplingMaxExtraSamples = motionSamplingMaxExtraSamples
         uniforms.pointee.motionSamplingLowThresholdPixels = motionSamplingLowThresholdPixels
         uniforms.pointee.motionSamplingHighThresholdPixels = motionSamplingHighThresholdPixels
-        frameIndex += 1
+        currentTemporalDenoiserParameters = TemporalDenoiserParameters(
+            jitterOffset: SIMD2<Float>(repeating: 0),
+            motionVectorScale: SIMD2<Float>(repeating: 1),
+            worldToViewMatrix: worldToView,
+            viewToClipMatrix: viewToClip,
+            shouldResetHistory: currentFrameIndex == 0,
+            preExposure: 1.0
+        )
+        frameIndex = currentFrameIndex + 1
         
         // Save current camera for next frame
         previousCamera = scene.camera
+    }
+
+    private func makeMetalFXWorldToViewMatrix(camera: Camera) -> simd_float4x4 {
+        let right = simd_normalize(camera.right)
+        let up = simd_normalize(camera.up)
+        let forward = simd_normalize(camera.forward)
+        let position = camera.position
+        
+        return simd_float4x4(columns: (
+            SIMD4<Float>(right.x, up.x, forward.x, 0.0),
+            SIMD4<Float>(right.y, up.y, forward.y, 0.0),
+            SIMD4<Float>(right.z, up.z, forward.z, 0.0),
+            SIMD4<Float>(-simd_dot(right, position),
+                         -simd_dot(up, position),
+                         -simd_dot(forward, position),
+                         1.0)
+        ))
+    }
+
+    private func makeMetalFXViewToClipMatrix(camera: Camera) -> simd_float4x4 {
+        let xScale = 1.0 / max(simd_length(camera.right), 1.0e-5)
+        let yScale = -1.0 / max(simd_length(camera.up), 1.0e-5)
+        let zScale = metalFXFarPlane / (metalFXFarPlane - metalFXNearPlane)
+        let wzScale = (-metalFXNearPlane * metalFXFarPlane) / (metalFXFarPlane - metalFXNearPlane)
+        
+        return simd_float4x4(columns: (
+            SIMD4<Float>(xScale, 0.0, 0.0, 0.0),
+            SIMD4<Float>(0.0, yScale, 0.0, 0.0),
+            SIMD4<Float>(0.0, 0.0, zScale, 1.0),
+            SIMD4<Float>(0.0, 0.0, wzScale, 0.0)
+        ))
     }
     
     func clampedRenderScale() -> Float {
@@ -715,6 +760,9 @@ class Renderer: NSObject {
         accumulationTargets[0].label = "Accumulation Texture 1"
         accumulationTargets[1].label = "Accumulation Texture 2"
         
+        framePresenter.createTextures(outputSize: outputSize, colorFormat: colorFormat, renderSize: inputSize, accumulationTargets: accumulationTargets)
+        let metalFXUsages = framePresenter.metalFXInputTextureUsages()
+        
         // Create a texture containing a random integer value for each pixel. the sample
         // uses these values to decorrelate pixels while drawing pseudorandom numbers from the
         // Halton sequence.
@@ -754,6 +802,7 @@ class Renderer: NSObject {
         depthDescriptor.height = inputHeight
         depthDescriptor.storageMode = .private
         depthDescriptor.usage = [.shaderRead, .shaderWrite]
+        depthDescriptor.usage.formUnion(metalFXUsages.depth)
         depthTexture = device.makeTexture(descriptor: depthDescriptor)
         depthTexture?.label = "Depth Texture"
         
@@ -764,6 +813,7 @@ class Renderer: NSObject {
         motionDescriptor.height = inputHeight
         motionDescriptor.storageMode = .private
         motionDescriptor.usage = [.shaderRead, .shaderWrite]
+        motionDescriptor.usage.formUnion(metalFXUsages.motion)
         motionTexture = device.makeTexture(descriptor: motionDescriptor)
         motionTexture?.label = "Motion Texture"
         
@@ -774,6 +824,7 @@ class Renderer: NSObject {
         diffuseDescriptor.height = inputHeight
         diffuseDescriptor.storageMode = .private
         diffuseDescriptor.usage = [.shaderRead, .shaderWrite]
+        diffuseDescriptor.usage.formUnion(metalFXUsages.diffuseAlbedo)
         diffuseAlbedoTexture = device.makeTexture(descriptor: diffuseDescriptor)
         diffuseAlbedoTexture?.label = "Diffuse Albedo Texture"
         
@@ -784,6 +835,7 @@ class Renderer: NSObject {
         specularDescriptor.height = inputHeight
         specularDescriptor.storageMode = .private
         specularDescriptor.usage = [.shaderRead, .shaderWrite]
+        specularDescriptor.usage.formUnion(metalFXUsages.specularAlbedo)
         specularAlbedoTexture = device.makeTexture(descriptor: specularDescriptor)
         specularAlbedoTexture?.label = "Specular Albedo Texture"
         
@@ -794,6 +846,7 @@ class Renderer: NSObject {
         normalDescriptor.height = inputHeight
         normalDescriptor.storageMode = .private
         normalDescriptor.usage = [.shaderRead, .shaderWrite]
+        normalDescriptor.usage.formUnion(metalFXUsages.normal)
         normalTexture = device.makeTexture(descriptor: normalDescriptor)
         normalTexture?.label = "Normal Texture"
         
@@ -804,11 +857,11 @@ class Renderer: NSObject {
         roughnessDescriptor.height = inputHeight
         roughnessDescriptor.storageMode = .private
         roughnessDescriptor.usage = [.shaderRead, .shaderWrite]
+        roughnessDescriptor.usage.formUnion(metalFXUsages.roughness)
         roughnessTexture = device.makeTexture(descriptor: roughnessDescriptor)
         roughnessTexture?.label = "Roughness Texture"
         
         lastDrawableSize = outputSize
-        framePresenter.createTextures(outputSize: outputSize, colorFormat: colorFormat, renderSize: inputSize, accumulationTargets: accumulationTargets)
         rebuildResidencySet()
     }
     
@@ -1506,7 +1559,7 @@ extension Renderer: MTKViewDelegate {
             commandBuffer.useResidencySet(residencySet)
         }
         
-        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, drawable: drawable, commandBuffer: commandBuffer)
+        framePresenter.draw(in: view, computeEvent: computeEvent, gpuFrameIndex: gpuFrameIndex, accumulationTargets: accumulationTargets, depthTexture: depthTexture, motionTexture: motionTexture, diffuseAlbedoTexture: diffuseAlbedoTexture, specularAlbedoTexture: specularAlbedoTexture, normalTexture: normalTexture, roughnessTexture: roughnessTexture, temporalDenoiserParameters: currentTemporalDenoiserParameters, drawable: drawable, commandBuffer: commandBuffer)
         
         gpuFrameIndex += 1
     }

@@ -256,8 +256,8 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
         
         float4 outDiffuseAlbedo = float4(0.0f);
         float4 outSpecularAlbedo = float4(0.0f);
-        float4 outNormal = float4(0.0f);
-        float4 outRoughness = float4(0.0f);
+        float4 outNormal = float4(0.0f, 0.0f, 1.0f, 1.0f);
+        float4 outRoughness = float4(1.0f, 0.0f, 0.0f, 1.0f);
         bool wroteGBuffer = false;
         
         int baseSamples = max(uniforms.samplesPerPixel, 1);
@@ -376,7 +376,7 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 prevScreenPos /= max(prevDepth, 0.001f);
                 
                 // Motion vector in pixel units (+Y down for texture space).
-                float2 motionNdc = screenPos - prevScreenPos;
+                float2 motionNdc = prevScreenPos - screenPos;
                 float rightScale = max(length(camera.right), 1e-5f);
                 float upScale = max(length(camera.up), 1e-5f);
                 float2 motionPixels = float2(
@@ -509,7 +509,7 @@ kernel void raytracingKernel(uint2 tid [[thread_position_in_grid]],
                 float3 specularAlbedo = mix(float3(0.04f), albedo, metallic);
                 outDiffuseAlbedo = float4(diffuseAlbedo, 1.0f);
                 outSpecularAlbedo = float4(specularAlbedo, 1.0f);
-                outNormal = float4(shadingNormal * 0.5f + 0.5f, 1.0f);
+                outNormal = float4(shadingNormal, 1.0f);
                 outRoughness = float4(roughnessForOutput, 0.0f, 0.0f, 1.0f);
                 wroteGBuffer = true;
             }

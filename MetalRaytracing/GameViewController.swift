@@ -318,7 +318,7 @@ class GameViewController: NSViewController {
     @objc private func shadingChanged(_ sender: NSSegmentedControl) {
         guard let renderer = renderer else { return }
         // Map selected segment to ShadingMode enum safely
-        if let mode = Renderer.ShadingMode(rawValue: sender.selectedSegment) {
+        if let mode = ShadingMode(rawValue: sender.selectedSegment) {
             renderer.shadingMode = mode
         }
     }

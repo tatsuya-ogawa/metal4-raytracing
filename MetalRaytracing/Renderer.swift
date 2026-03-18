@@ -252,7 +252,8 @@ class Renderer: NSObject {
         metalView.device = device
         metalView.colorPixelFormat = .rgba16Float // .rgba16Float
         metalView.sampleCount = 1
-        metalView.drawableSize = size
+        
+        // Remove manual drawableSize assignment so MTKView uses native backing scale factor
         
         self.device = device
         self.commandQueue = device.makeMTL4CommandQueue()!

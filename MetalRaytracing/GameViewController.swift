@@ -20,6 +20,12 @@ class GameViewController: NSViewController {
     private var viewModeControl: NSSegmentedControl?
     private var animationToggleButton: NSButton?
     private var fpsLabel: NSTextField?
+    private var motionMinLabel: NSTextField?
+    private var motionLowLabel: NSTextField?
+    private var motionHighLabel: NSTextField?
+    private var motionMinContainer: NSView?
+    private var motionLowContainer: NSView?
+    private var motionHighContainer: NSView?
     var playerModelIndex: Int = 0
 
     override func viewDidLoad() {
@@ -123,30 +129,67 @@ class GameViewController: NSViewController {
         accumulationSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
 
         // Motion-adaptive accumulation controls
-        let motionAccumCheckbox = NSButton(checkboxWithTitle: "Motion Accum", target: self, action: #selector(motionAccumulationToggled(_:)))
+        let motionAccumContainer = NSStackView()
+        motionAccumContainer.orientation = .horizontal
+        motionAccumContainer.spacing = 8
+        motionAccumContainer.alignment = .centerY
+
+        let motionAccumLabel = NSTextField(labelWithString: "Motion Accum")
+        motionAccumLabel.font = NSFont.systemFont(ofSize: 12)
+
+        let motionAccumCheckbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(motionAccumulationToggled(_:)))
         motionAccumCheckbox.state = (renderer?.useMotionAdaptiveAccumulation ?? true) ? .on : .off
-        
-        let motionMinLabel = NSTextField(labelWithString: "Motion Min Weight:")
+        motionAccumContainer.addArrangedSubview(motionAccumLabel)
+        motionAccumContainer.addArrangedSubview(motionAccumCheckbox)
+
+        let motionMinContainer = NSStackView()
+        motionMinContainer.orientation = .vertical
+        motionMinContainer.spacing = 2
+        motionMinContainer.alignment = .leading
+
+        let motionMinLabel = NSTextField(labelWithString: String(format: "Motion Min: %.2f", renderer?.motionAccumulationMinWeight ?? 0.1))
         motionMinLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionMinLabel = motionMinLabel
         let motionMinSlider = NSSlider(value: Double(renderer?.motionAccumulationMinWeight ?? 0.1), minValue: 0.0, maxValue: 0.95, target: self, action: #selector(motionAccumulationMinChanged(_:)))
         motionMinSlider.isContinuous = true
         motionMinSlider.controlSize = .small
         motionMinSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
-        let motionLowLabel = NSTextField(labelWithString: "Motion Low (px):")
+        motionMinContainer.addArrangedSubview(motionMinLabel)
+        motionMinContainer.addArrangedSubview(motionMinSlider)
+        self.motionMinContainer = motionMinContainer
+
+        let motionLowContainer = NSStackView()
+        motionLowContainer.orientation = .vertical
+        motionLowContainer.spacing = 2
+        motionLowContainer.alignment = .leading
+
+        let motionLowLabel = NSTextField(labelWithString: String(format: "Motion Low: %.2fpx", renderer?.motionAccumulationLowThresholdPixels ?? 0.5))
         motionLowLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionLowLabel = motionLowLabel
         let motionLowSlider = NSSlider(value: Double(renderer?.motionAccumulationLowThresholdPixels ?? 0.5), minValue: 0.0, maxValue: 10.0, target: self, action: #selector(motionAccumulationLowChanged(_:)))
         motionLowSlider.isContinuous = true
         motionLowSlider.controlSize = .small
         motionLowSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
-        let motionHighLabel = NSTextField(labelWithString: "Motion High (px):")
+        motionLowContainer.addArrangedSubview(motionLowLabel)
+        motionLowContainer.addArrangedSubview(motionLowSlider)
+        self.motionLowContainer = motionLowContainer
+
+        let motionHighContainer = NSStackView()
+        motionHighContainer.orientation = .vertical
+        motionHighContainer.spacing = 2
+        motionHighContainer.alignment = .leading
+
+        let motionHighLabel = NSTextField(labelWithString: String(format: "Motion High: %.2fpx", renderer?.motionAccumulationHighThresholdPixels ?? 4.0))
         motionHighLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionHighLabel = motionHighLabel
         let motionHighSlider = NSSlider(value: Double(renderer?.motionAccumulationHighThresholdPixels ?? 4.0), minValue: 0.0, maxValue: 10.0, target: self, action: #selector(motionAccumulationHighChanged(_:)))
         motionHighSlider.isContinuous = true
         motionHighSlider.controlSize = .small
         motionHighSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
+        motionHighContainer.addArrangedSubview(motionHighLabel)
+        motionHighContainer.addArrangedSubview(motionHighSlider)
+        self.motionHighContainer = motionHighContainer
+
         
         // Bounces control
         let bouncesLabel = NSTextField(labelWithString: "Ray Bounces:")
@@ -212,7 +255,7 @@ class GameViewController: NSViewController {
         hint.font = NSFont.systemFont(ofSize: 11)
         hint.textColor = NSColor.secondaryLabelColor
         
-        let stack = NSStackView(views: [title, fpsLabel, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
+        let stack = NSStackView(views: [title, fpsLabel, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
         stack.orientation = .vertical
         stack.spacing = 6
         stack.alignment = .leading
@@ -232,6 +275,7 @@ class GameViewController: NSViewController {
         ])
 
         updateAnimationButtonTitle()
+        updateMotionAccumulationControls(isEnabled: renderer?.useMotionAdaptiveAccumulation ?? true, animated: false)
         
         renderer.fpsUpdateHandler = { [weak self] fps, frameTime in
             self?.fpsLabel?.stringValue = String(format: "FPS: %.1f | %.1f ms", fps, frameTime)
@@ -350,23 +394,64 @@ class GameViewController: NSViewController {
     }
     
     @objc private func motionAccumulationToggled(_ sender: NSButton) {
-        renderer?.useMotionAdaptiveAccumulation = (sender.state == .on)
+        let isEnabled = (sender.state == .on)
+        renderer?.useMotionAdaptiveAccumulation = isEnabled
+        updateMotionAccumulationControls(isEnabled: isEnabled, animated: true)
     }
     
     @objc private func motionAccumulationMinChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationMinWeight = sender.floatValue
+        motionMinLabel?.stringValue = String(format: "Motion Min: %.2f", sender.floatValue)
     }
     
     @objc private func motionAccumulationLowChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationLowThresholdPixels = sender.floatValue
+        motionLowLabel?.stringValue = String(format: "Motion Low: %.2fpx", sender.floatValue)
     }
     
     @objc private func motionAccumulationHighChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationHighThresholdPixels = sender.floatValue
+        motionHighLabel?.stringValue = String(format: "Motion High: %.2fpx", sender.floatValue)
     }
 
     private func updateAnimationButtonTitle() {
         animationToggleButton?.title = (renderer?.isAnimationPaused ?? false) ? "Resume Animation" : "Stop Animation"
+    }
+
+    private func updateMotionAccumulationControls(isEnabled: Bool, animated: Bool) {
+        let views = [motionMinContainer, motionLowContainer, motionHighContainer].compactMap { $0 }
+
+        guard animated else {
+            views.forEach {
+                $0.alphaValue = 1
+                $0.isHidden = !isEnabled
+            }
+            return
+        }
+
+        if isEnabled {
+            views.forEach {
+                $0.alphaValue = 0
+                $0.isHidden = false
+            }
+
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                views.forEach { $0.animator().alphaValue = 1 }
+                self.view.layoutSubtreeIfNeeded()
+            }
+        } else {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.25
+                views.forEach { $0.animator().alphaValue = 0 }
+                self.view.layoutSubtreeIfNeeded()
+            }, completionHandler: {
+                views.forEach {
+                    $0.isHidden = true
+                    $0.alphaValue = 1
+                }
+            })
+        }
     }
     
     

@@ -19,6 +19,7 @@ class GameViewController: NSViewController {
     private var scaleControl: NSPopUpButton?
     private var viewModeControl: NSSegmentedControl?
     private var animationToggleButton: NSButton?
+    private var fpsLabel: NSTextField?
     var playerModelIndex: Int = 0
 
     override func viewDidLoad() {
@@ -88,6 +89,11 @@ class GameViewController: NSViewController {
         popup.target = self
         popup.action = #selector(viewPresetChanged(_:))
         viewPresetPopup = popup
+        
+        let fpsLabel = NSTextField(labelWithString: "FPS: 0.0 | 0.0 ms")
+        fpsLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        fpsLabel.textColor = .systemGreen
+        self.fpsLabel = fpsLabel
         
         // UpScaler control
         let upscalerLabel = NSTextField(labelWithString: "Upscaler:")
@@ -206,7 +212,7 @@ class GameViewController: NSViewController {
         hint.font = NSFont.systemFont(ofSize: 11)
         hint.textColor = NSColor.secondaryLabelColor
         
-        let stack = NSStackView(views: [title, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
+        let stack = NSStackView(views: [title, fpsLabel, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
         stack.orientation = .vertical
         stack.spacing = 6
         stack.alignment = .leading
@@ -226,6 +232,10 @@ class GameViewController: NSViewController {
         ])
 
         updateAnimationButtonTitle()
+        
+        renderer.fpsUpdateHandler = { [weak self] fps, frameTime in
+            self?.fpsLabel?.stringValue = String(format: "FPS: %.1f | %.1f ms", fps, frameTime)
+        }
     }
     
     @objc private func viewPresetChanged(_ sender: NSPopUpButton) {
@@ -424,6 +434,7 @@ class GameViewController: UIViewController {
     private var scaleControl: UISegmentedControl?
     private var viewModeControl: UISegmentedControl?
     private var animationToggleButton: UIButton?
+    private var fpsLabel: UILabel?
     
     // UI Elements for visibility toggling
     private var controlsContainer: UIView?
@@ -531,6 +542,12 @@ class GameViewController: UIViewController {
         button.showsMenuAsPrimaryAction = true
         button.menu = buildViewPresetMenu(selectedIndex: selectedViewPresetIndex)
         viewPresetButton = button
+
+        let fpsLabel = UILabel()
+        fpsLabel.text = "FPS: 0.0 | 0.0 ms"
+        fpsLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular)
+        fpsLabel.textColor = .systemGreen
+        self.fpsLabel = fpsLabel
 
         // UpScaler control
         let upscalerContainer = UIStackView()
@@ -844,7 +861,7 @@ class GameViewController: UIViewController {
         shadingContainer.addArrangedSubview(shadingLabel)
         shadingContainer.addArrangedSubview(shadingSegment)
 
-        let stack = UIStackView(arrangedSubviews: [title, button, modeContainer, animationContainer, debugContainer, shadingContainer, samplesContainer, accumulationContainer, bouncesContainer, lightContainer, upscalerContainer, scaleContainer, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
+        let stack = UIStackView(arrangedSubviews: [title, fpsLabel, button, modeContainer, animationContainer, debugContainer, shadingContainer, samplesContainer, accumulationContainer, bouncesContainer, lightContainer, upscalerContainer, scaleContainer, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
         stack.axis = .vertical
         stack.spacing = 6
         stack.alignment = .leading
@@ -894,6 +911,10 @@ class GameViewController: UIViewController {
         ])
 
         updateAnimationButtonTitle()
+        
+        renderer.fpsUpdateHandler = { [weak self] fps, frameTime in
+            self?.fpsLabel?.text = String(format: "FPS: %.1f | %.1f ms", fps, frameTime)
+        }
     }
 
     @objc private func toggleControls(_ sender: UIButton) {

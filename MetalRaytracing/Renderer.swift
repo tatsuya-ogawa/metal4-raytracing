@@ -69,6 +69,11 @@ class Renderer: NSObject {
     var framePresenter: FramePresenter!
     private var currentTemporalDenoiserParameters = TemporalDenoiserParameters()
     
+    // FPS tracking
+    var fpsUpdateHandler: ((Double, Double) -> Void)? // fps, frameTimeMs
+    private var lastTime: CFTimeInterval = 0
+    private var frameCount: Int = 0
+    
     // Temporal scaler toggle
     var useTemporalScaler: Bool = false {
         didSet {
@@ -1465,6 +1470,19 @@ class Renderer: NSObject {
 
 extension Renderer: MTKViewDelegate {
     func draw(in view: MTKView) {
+        let currentTime = CACurrentMediaTime()
+        if lastTime == 0 { lastTime = currentTime }
+        frameCount += 1
+        if currentTime - lastTime >= 1.0 { // Update every second
+            let fps = Double(frameCount) / (currentTime - lastTime)
+            let frameTimeMs = (currentTime - lastTime) * 1000.0 / Double(frameCount)
+            lastTime = currentTime
+            frameCount = 0
+            DispatchQueue.main.async { [weak self] in
+                self?.fpsUpdateHandler?(fps, frameTimeMs)
+            }
+        }
+
         let previousValueToWaitFor = gpuFrameIndex - UInt64(maxFramesInFlight)
         if !endFrameEvent.wait(untilSignaledValue: previousValueToWaitFor, timeoutMS: 100){
             return

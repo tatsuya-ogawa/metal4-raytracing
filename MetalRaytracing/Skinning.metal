@@ -3,6 +3,24 @@ using namespace metal;
 
 #import "ShaderTypes.h"
 
+static inline void accumulateSkinningContribution(ushort jointIndex,
+                                                  float weight,
+                                                  float3 position,
+                                                  float3 normal,
+                                                  constant float4x4 *jointMatrices,
+                                                  uint jointCount,
+                                                  thread float4 &skinnedPos,
+                                                  thread float3 &skinnedNrm)
+{
+    if (weight <= 0.0 || jointIndex >= jointCount) {
+        return;
+    }
+
+    const float4x4 jointMatrix = jointMatrices[jointIndex];
+    skinnedPos += weight * (jointMatrix * float4(position, 1.0));
+    skinnedNrm += weight * (jointMatrix * float4(normal, 0.0)).xyz;
+}
+
 // Kernel to perform linear blend skinning on the GPU
 kernel void skinningKernel(uint vertexID [[thread_position_in_grid]],
                            constant float3 *restPositions [[buffer(BufferIndexRestPositions)]],
@@ -12,9 +30,9 @@ kernel void skinningKernel(uint vertexID [[thread_position_in_grid]],
                            constant float4x4 *jointMatrices [[buffer(BufferIndexJointMatrices)]],
                            device float3 *skinnedPositions [[buffer(BufferIndexSkinnedPositions)]],
                            device float3 *skinnedNormals [[buffer(BufferIndexSkinnedNormals)]],
-                           constant uint &vertexCount [[buffer(BufferIndexUniforms)]])
+                           constant SkinningUniforms &uniforms [[buffer(BufferIndexUniforms)]])
 {
-    if (vertexID >= vertexCount) {
+    if (vertexID >= uniforms.vertexCount) {
         return;
     }
 
@@ -33,16 +51,11 @@ kernel void skinningKernel(uint vertexID [[thread_position_in_grid]],
     float4 skinnedPos = float4(0.0);
     float3 skinnedNrm = float3(0.0);
 
-    // Unroll manually for 4 weights
-    skinnedPos += weights.x * (jointMatrices[indices.x] * float4(position, 1.0));
-    skinnedPos += weights.y * (jointMatrices[indices.y] * float4(position, 1.0));
-    skinnedPos += weights.z * (jointMatrices[indices.z] * float4(position, 1.0));
-    skinnedPos += weights.w * (jointMatrices[indices.w] * float4(position, 1.0));
-
-    skinnedNrm += weights.x * (jointMatrices[indices.x] * float4(normal, 0.0)).xyz;
-    skinnedNrm += weights.y * (jointMatrices[indices.y] * float4(normal, 0.0)).xyz;
-    skinnedNrm += weights.z * (jointMatrices[indices.z] * float4(normal, 0.0)).xyz;
-    skinnedNrm += weights.w * (jointMatrices[indices.w] * float4(normal, 0.0)).xyz;
+    // Skip invalid palette indices instead of reading outside the joint palette.
+    accumulateSkinningContribution(indices.x, weights.x, position, normal, jointMatrices, uniforms.jointCount, skinnedPos, skinnedNrm);
+    accumulateSkinningContribution(indices.y, weights.y, position, normal, jointMatrices, uniforms.jointCount, skinnedPos, skinnedNrm);
+    accumulateSkinningContribution(indices.z, weights.z, position, normal, jointMatrices, uniforms.jointCount, skinnedPos, skinnedNrm);
+    accumulateSkinningContribution(indices.w, weights.w, position, normal, jointMatrices, uniforms.jointCount, skinnedPos, skinnedNrm);
 
     skinnedPositions[vertexID] = skinnedPos.xyz;
     skinnedNormals[vertexID] = skinnedNrm;

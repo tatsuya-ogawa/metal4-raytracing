@@ -77,6 +77,11 @@ typedef NS_ENUM(NSInteger, VertexAttribute) {
   VertexAttributeJointWeights = 4
 };
 
+struct SkinningUniforms {
+  unsigned int vertexCount;
+  unsigned int jointCount;
+};
+
 struct Camera {
   vector_float3 position;
   vector_float3 right;

@@ -10,7 +10,7 @@ import Cocoa
 import MetalKit
 
 // Our macOS specific view controller
-class GameViewController: NSViewController {
+class GameViewController: NSViewController, NSGestureRecognizerDelegate {
 
     var renderer: Renderer!
     var mtkView: MTKView!
@@ -20,6 +20,7 @@ class GameViewController: NSViewController {
     private var viewModeControl: NSSegmentedControl?
     private var animationToggleButton: NSButton?
     private var fpsLabel: NSTextField?
+    private var controlsContainer: NSView?
     private var motionMinLabel: NSTextField?
     private var motionLowLabel: NSTextField?
     private var motionHighLabel: NSTextField?
@@ -69,9 +70,11 @@ class GameViewController: NSViewController {
         guard let mtkView = mtkView else { return }
         
         let pan = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.delegate = self
         mtkView.addGestureRecognizer(pan)
         
         let magnify = NSMagnificationGestureRecognizer(target: self, action: #selector(handleMagnify(_:)))
+        magnify.delegate = self
         mtkView.addGestureRecognizer(magnify)
     }
     
@@ -85,6 +88,7 @@ class GameViewController: NSViewController {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.cornerRadius = 8
+        self.controlsContainer = container
         
         let title = NSTextField(labelWithString: "View")
         title.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
@@ -452,6 +456,12 @@ class GameViewController: NSViewController {
                 }
             })
         }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+        guard let container = controlsContainer else { return true }
+        let point = gestureRecognizer.location(in: container)
+        return !container.bounds.contains(point)
     }
     
     

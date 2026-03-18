@@ -21,6 +21,7 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
     private var animationToggleButton: NSButton?
     private var fpsLabel: NSTextField?
     private var controlsContainer: NSView?
+    private var controlsToggleButton: NSButton?
     private var motionMinLabel: NSTextField?
     private var motionLowLabel: NSTextField?
     private var motionHighLabel: NSTextField?
@@ -80,7 +81,14 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
     
     private func setupControls() {
         guard let mtkView = mtkView else { return }
-        
+
+        let toggleBtn = NSButton(title: "Hide Panel", target: self, action: #selector(toggleControls(_:)))
+        toggleBtn.bezelStyle = .texturedRounded
+        toggleBtn.controlSize = .small
+        toggleBtn.translatesAutoresizingMaskIntoConstraints = false
+        self.controlsToggleButton = toggleBtn
+        mtkView.addSubview(toggleBtn)
+
         let container = NSVisualEffectView()
         container.material = .hudWindow
         container.blendingMode = .withinWindow
@@ -264,21 +272,59 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
         stack.spacing = 6
         stack.alignment = .leading
         stack.translatesAutoresizingMaskIntoConstraints = false
-        
-        container.addSubview(stack)
+
+        let documentView = NSView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(stack)
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.documentView = documentView
+
+        container.addSubview(scrollView)
         mtkView.addSubview(container)
+
+        let fitHeight = container.heightAnchor.constraint(equalTo: documentView.heightAnchor)
+        fitHeight.priority = .defaultHigh
+        let fitWidth = container.widthAnchor.constraint(equalToConstant: max(260, stack.fittingSize.width + 20))
+        fitWidth.priority = .defaultHigh
+        let maxHeight = container.heightAnchor.constraint(lessThanOrEqualTo: mtkView.heightAnchor, constant: -24)
+        maxHeight.priority = .required
         
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
-            
-            container.leadingAnchor.constraint(equalTo: mtkView.leadingAnchor, constant: 12),
-            container.topAnchor.constraint(equalTo: mtkView.topAnchor, constant: 12)
+            toggleBtn.leadingAnchor.constraint(equalTo: mtkView.leadingAnchor, constant: 12),
+            toggleBtn.topAnchor.constraint(equalTo: mtkView.topAnchor, constant: 12),
+
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: container.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -8),
+
+            container.leadingAnchor.constraint(equalTo: toggleBtn.leadingAnchor),
+            container.topAnchor.constraint(equalTo: toggleBtn.bottomAnchor, constant: 8),
+            container.trailingAnchor.constraint(lessThanOrEqualTo: mtkView.trailingAnchor, constant: -12),
+            container.bottomAnchor.constraint(lessThanOrEqualTo: mtkView.bottomAnchor, constant: -12),
+            fitHeight,
+            fitWidth,
+            maxHeight
         ])
 
         updateAnimationButtonTitle()
+        updateControlsPanelVisibility(isVisible: true, animated: false)
         updateMotionAccumulationControls(isEnabled: renderer?.useMotionAdaptiveAccumulation ?? true, animated: false)
         
         renderer.fpsUpdateHandler = { [weak self] fps, frameTime in
@@ -396,6 +442,11 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
         guard let renderer = renderer else { return }
         renderer.accumulationWeight = sender.floatValue
     }
+
+    @objc private func toggleControls(_ sender: NSButton) {
+        let shouldShow = controlsContainer?.isHidden ?? false
+        updateControlsPanelVisibility(isVisible: shouldShow, animated: true)
+    }
     
     @objc private func motionAccumulationToggled(_ sender: NSButton) {
         let isEnabled = (sender.state == .on)
@@ -420,6 +471,34 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
 
     private func updateAnimationButtonTitle() {
         animationToggleButton?.title = (renderer?.isAnimationPaused ?? false) ? "Resume Animation" : "Stop Animation"
+    }
+
+    private func updateControlsPanelVisibility(isVisible: Bool, animated: Bool) {
+        guard let container = controlsContainer else { return }
+
+        controlsToggleButton?.title = isVisible ? "Hide Panel" : "Show Panel"
+
+        guard animated else {
+            container.isHidden = !isVisible
+            container.alphaValue = isVisible ? 1 : 0
+            return
+        }
+
+        if isVisible {
+            container.alphaValue = 0
+            container.isHidden = false
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                container.animator().alphaValue = 1
+            }
+        } else {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.2
+                container.animator().alphaValue = 0
+            }, completionHandler: {
+                container.isHidden = true
+            })
+        }
     }
 
     private func updateMotionAccumulationControls(isEnabled: Bool, animated: Bool) {
@@ -459,9 +538,21 @@ class GameViewController: NSViewController, NSGestureRecognizerDelegate {
     }
 
     func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
-        guard let container = controlsContainer else { return true }
-        let point = gestureRecognizer.location(in: container)
-        return !container.bounds.contains(point)
+        if let toggleButton = controlsToggleButton {
+            let point = gestureRecognizer.location(in: toggleButton)
+            if toggleButton.bounds.contains(point) {
+                return false
+            }
+        }
+
+        if let container = controlsContainer, !container.isHidden {
+            let point = gestureRecognizer.location(in: container)
+            if container.bounds.contains(point) {
+                return false
+            }
+        }
+
+        return true
     }
     
     

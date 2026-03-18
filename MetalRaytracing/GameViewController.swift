@@ -10,7 +10,7 @@ import Cocoa
 import MetalKit
 
 // Our macOS specific view controller
-class GameViewController: NSViewController {
+class GameViewController: NSViewController, NSGestureRecognizerDelegate {
 
     var renderer: Renderer!
     var mtkView: MTKView!
@@ -20,6 +20,14 @@ class GameViewController: NSViewController {
     private var viewModeControl: NSSegmentedControl?
     private var animationToggleButton: NSButton?
     private var fpsLabel: NSTextField?
+    private var controlsContainer: NSView?
+    private var controlsToggleButton: NSButton?
+    private var motionMinLabel: NSTextField?
+    private var motionLowLabel: NSTextField?
+    private var motionHighLabel: NSTextField?
+    private var motionMinContainer: NSView?
+    private var motionLowContainer: NSView?
+    private var motionHighContainer: NSView?
     var playerModelIndex: Int = 0
 
     override func viewDidLoad() {
@@ -63,15 +71,24 @@ class GameViewController: NSViewController {
         guard let mtkView = mtkView else { return }
         
         let pan = NSPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.delegate = self
         mtkView.addGestureRecognizer(pan)
         
         let magnify = NSMagnificationGestureRecognizer(target: self, action: #selector(handleMagnify(_:)))
+        magnify.delegate = self
         mtkView.addGestureRecognizer(magnify)
     }
     
     private func setupControls() {
         guard let mtkView = mtkView else { return }
-        
+
+        let toggleBtn = NSButton(title: "Hide Panel", target: self, action: #selector(toggleControls(_:)))
+        toggleBtn.bezelStyle = .texturedRounded
+        toggleBtn.controlSize = .small
+        toggleBtn.translatesAutoresizingMaskIntoConstraints = false
+        self.controlsToggleButton = toggleBtn
+        mtkView.addSubview(toggleBtn)
+
         let container = NSVisualEffectView()
         container.material = .hudWindow
         container.blendingMode = .withinWindow
@@ -79,6 +96,7 @@ class GameViewController: NSViewController {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.wantsLayer = true
         container.layer?.cornerRadius = 8
+        self.controlsContainer = container
         
         let title = NSTextField(labelWithString: "View")
         title.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
@@ -123,30 +141,67 @@ class GameViewController: NSViewController {
         accumulationSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
 
         // Motion-adaptive accumulation controls
-        let motionAccumCheckbox = NSButton(checkboxWithTitle: "Motion Accum", target: self, action: #selector(motionAccumulationToggled(_:)))
+        let motionAccumContainer = NSStackView()
+        motionAccumContainer.orientation = .horizontal
+        motionAccumContainer.spacing = 8
+        motionAccumContainer.alignment = .centerY
+
+        let motionAccumLabel = NSTextField(labelWithString: "Motion Accum")
+        motionAccumLabel.font = NSFont.systemFont(ofSize: 12)
+
+        let motionAccumCheckbox = NSButton(checkboxWithTitle: "", target: self, action: #selector(motionAccumulationToggled(_:)))
         motionAccumCheckbox.state = (renderer?.useMotionAdaptiveAccumulation ?? true) ? .on : .off
-        
-        let motionMinLabel = NSTextField(labelWithString: "Motion Min Weight:")
+        motionAccumContainer.addArrangedSubview(motionAccumLabel)
+        motionAccumContainer.addArrangedSubview(motionAccumCheckbox)
+
+        let motionMinContainer = NSStackView()
+        motionMinContainer.orientation = .vertical
+        motionMinContainer.spacing = 2
+        motionMinContainer.alignment = .leading
+
+        let motionMinLabel = NSTextField(labelWithString: String(format: "Motion Min: %.2f", renderer?.motionAccumulationMinWeight ?? 0.1))
         motionMinLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionMinLabel = motionMinLabel
         let motionMinSlider = NSSlider(value: Double(renderer?.motionAccumulationMinWeight ?? 0.1), minValue: 0.0, maxValue: 0.95, target: self, action: #selector(motionAccumulationMinChanged(_:)))
         motionMinSlider.isContinuous = true
         motionMinSlider.controlSize = .small
         motionMinSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
-        let motionLowLabel = NSTextField(labelWithString: "Motion Low (px):")
+        motionMinContainer.addArrangedSubview(motionMinLabel)
+        motionMinContainer.addArrangedSubview(motionMinSlider)
+        self.motionMinContainer = motionMinContainer
+
+        let motionLowContainer = NSStackView()
+        motionLowContainer.orientation = .vertical
+        motionLowContainer.spacing = 2
+        motionLowContainer.alignment = .leading
+
+        let motionLowLabel = NSTextField(labelWithString: String(format: "Motion Low: %.2fpx", renderer?.motionAccumulationLowThresholdPixels ?? 0.5))
         motionLowLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionLowLabel = motionLowLabel
         let motionLowSlider = NSSlider(value: Double(renderer?.motionAccumulationLowThresholdPixels ?? 0.5), minValue: 0.0, maxValue: 10.0, target: self, action: #selector(motionAccumulationLowChanged(_:)))
         motionLowSlider.isContinuous = true
         motionLowSlider.controlSize = .small
         motionLowSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
-        let motionHighLabel = NSTextField(labelWithString: "Motion High (px):")
+        motionLowContainer.addArrangedSubview(motionLowLabel)
+        motionLowContainer.addArrangedSubview(motionLowSlider)
+        self.motionLowContainer = motionLowContainer
+
+        let motionHighContainer = NSStackView()
+        motionHighContainer.orientation = .vertical
+        motionHighContainer.spacing = 2
+        motionHighContainer.alignment = .leading
+
+        let motionHighLabel = NSTextField(labelWithString: String(format: "Motion High: %.2fpx", renderer?.motionAccumulationHighThresholdPixels ?? 4.0))
         motionHighLabel.font = NSFont.systemFont(ofSize: 12)
+        self.motionHighLabel = motionHighLabel
         let motionHighSlider = NSSlider(value: Double(renderer?.motionAccumulationHighThresholdPixels ?? 4.0), minValue: 0.0, maxValue: 10.0, target: self, action: #selector(motionAccumulationHighChanged(_:)))
         motionHighSlider.isContinuous = true
         motionHighSlider.controlSize = .small
         motionHighSlider.widthAnchor.constraint(equalToConstant: 120).isActive = true
-        
+        motionHighContainer.addArrangedSubview(motionHighLabel)
+        motionHighContainer.addArrangedSubview(motionHighSlider)
+        self.motionHighContainer = motionHighContainer
+
         
         // Bounces control
         let bouncesLabel = NSTextField(labelWithString: "Ray Bounces:")
@@ -212,26 +267,65 @@ class GameViewController: NSViewController {
         hint.font = NSFont.systemFont(ofSize: 11)
         hint.textColor = NSColor.secondaryLabelColor
         
-        let stack = NSStackView(views: [title, fpsLabel, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, motionAccumCheckbox, motionMinLabel, motionMinSlider, motionLowLabel, motionLowSlider, motionHighLabel, motionHighSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, hint])
+        let stack = NSStackView(views: [title, fpsLabel, popup, modeLabel, modeSegment, animationLabel, animationButton, debugLabel, debugPopup, shadingLabel, shadingSegment, samplesLabel, samplesPopup, accumulationLabel, accumulationSlider, bouncesLabel, bouncesPopup, lightLabel, lightSlider, upscalerLabel, upscalerSegment, scaleLabel, scalePopup, motionAccumContainer, motionMinContainer, motionLowContainer, motionHighContainer, hint])
         stack.orientation = .vertical
         stack.spacing = 6
         stack.alignment = .leading
         stack.translatesAutoresizingMaskIntoConstraints = false
-        
-        container.addSubview(stack)
+
+        let documentView = NSView()
+        documentView.translatesAutoresizingMaskIntoConstraints = false
+        documentView.addSubview(stack)
+
+        let scrollView = NSScrollView()
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.documentView = documentView
+
+        container.addSubview(scrollView)
         mtkView.addSubview(container)
+
+        let fitHeight = container.heightAnchor.constraint(equalTo: documentView.heightAnchor)
+        fitHeight.priority = .defaultHigh
+        let fitWidth = container.widthAnchor.constraint(equalToConstant: max(260, stack.fittingSize.width + 20))
+        fitWidth.priority = .defaultHigh
+        let maxHeight = container.heightAnchor.constraint(lessThanOrEqualTo: mtkView.heightAnchor, constant: -24)
+        maxHeight.priority = .required
         
         NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 10),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -10),
-            stack.topAnchor.constraint(equalTo: container.topAnchor, constant: 8),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -8),
-            
-            container.leadingAnchor.constraint(equalTo: mtkView.leadingAnchor, constant: 12),
-            container.topAnchor.constraint(equalTo: mtkView.topAnchor, constant: 12)
+            toggleBtn.leadingAnchor.constraint(equalTo: mtkView.leadingAnchor, constant: 12),
+            toggleBtn.topAnchor.constraint(equalTo: mtkView.topAnchor, constant: 12),
+
+            scrollView.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            scrollView.topAnchor.constraint(equalTo: container.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+
+            documentView.leadingAnchor.constraint(equalTo: scrollView.contentView.leadingAnchor),
+            documentView.trailingAnchor.constraint(equalTo: scrollView.contentView.trailingAnchor),
+            documentView.topAnchor.constraint(equalTo: scrollView.contentView.topAnchor),
+            documentView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor),
+
+            stack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor, constant: 10),
+            stack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor, constant: -10),
+            stack.topAnchor.constraint(equalTo: documentView.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor, constant: -8),
+
+            container.leadingAnchor.constraint(equalTo: toggleBtn.leadingAnchor),
+            container.topAnchor.constraint(equalTo: toggleBtn.bottomAnchor, constant: 8),
+            container.trailingAnchor.constraint(lessThanOrEqualTo: mtkView.trailingAnchor, constant: -12),
+            container.bottomAnchor.constraint(lessThanOrEqualTo: mtkView.bottomAnchor, constant: -12),
+            fitHeight,
+            fitWidth,
+            maxHeight
         ])
 
         updateAnimationButtonTitle()
+        updateControlsPanelVisibility(isVisible: true, animated: false)
+        updateMotionAccumulationControls(isEnabled: renderer?.useMotionAdaptiveAccumulation ?? true, animated: false)
         
         renderer.fpsUpdateHandler = { [weak self] fps, frameTime in
             self?.fpsLabel?.stringValue = String(format: "FPS: %.1f | %.1f ms", fps, frameTime)
@@ -348,25 +442,117 @@ class GameViewController: NSViewController {
         guard let renderer = renderer else { return }
         renderer.accumulationWeight = sender.floatValue
     }
+
+    @objc private func toggleControls(_ sender: NSButton) {
+        let shouldShow = controlsContainer?.isHidden ?? false
+        updateControlsPanelVisibility(isVisible: shouldShow, animated: true)
+    }
     
     @objc private func motionAccumulationToggled(_ sender: NSButton) {
-        renderer?.useMotionAdaptiveAccumulation = (sender.state == .on)
+        let isEnabled = (sender.state == .on)
+        renderer?.useMotionAdaptiveAccumulation = isEnabled
+        updateMotionAccumulationControls(isEnabled: isEnabled, animated: true)
     }
     
     @objc private func motionAccumulationMinChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationMinWeight = sender.floatValue
+        motionMinLabel?.stringValue = String(format: "Motion Min: %.2f", sender.floatValue)
     }
     
     @objc private func motionAccumulationLowChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationLowThresholdPixels = sender.floatValue
+        motionLowLabel?.stringValue = String(format: "Motion Low: %.2fpx", sender.floatValue)
     }
     
     @objc private func motionAccumulationHighChanged(_ sender: NSSlider) {
         renderer?.motionAccumulationHighThresholdPixels = sender.floatValue
+        motionHighLabel?.stringValue = String(format: "Motion High: %.2fpx", sender.floatValue)
     }
 
     private func updateAnimationButtonTitle() {
         animationToggleButton?.title = (renderer?.isAnimationPaused ?? false) ? "Resume Animation" : "Stop Animation"
+    }
+
+    private func updateControlsPanelVisibility(isVisible: Bool, animated: Bool) {
+        guard let container = controlsContainer else { return }
+
+        controlsToggleButton?.title = isVisible ? "Hide Panel" : "Show Panel"
+
+        guard animated else {
+            container.isHidden = !isVisible
+            container.alphaValue = isVisible ? 1 : 0
+            return
+        }
+
+        if isVisible {
+            container.alphaValue = 0
+            container.isHidden = false
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.2
+                container.animator().alphaValue = 1
+            }
+        } else {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.2
+                container.animator().alphaValue = 0
+            }, completionHandler: {
+                container.isHidden = true
+            })
+        }
+    }
+
+    private func updateMotionAccumulationControls(isEnabled: Bool, animated: Bool) {
+        let views = [motionMinContainer, motionLowContainer, motionHighContainer].compactMap { $0 }
+
+        guard animated else {
+            views.forEach {
+                $0.alphaValue = 1
+                $0.isHidden = !isEnabled
+            }
+            return
+        }
+
+        if isEnabled {
+            views.forEach {
+                $0.alphaValue = 0
+                $0.isHidden = false
+            }
+
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.25
+                views.forEach { $0.animator().alphaValue = 1 }
+                self.view.layoutSubtreeIfNeeded()
+            }
+        } else {
+            NSAnimationContext.runAnimationGroup({ context in
+                context.duration = 0.25
+                views.forEach { $0.animator().alphaValue = 0 }
+                self.view.layoutSubtreeIfNeeded()
+            }, completionHandler: {
+                views.forEach {
+                    $0.isHidden = true
+                    $0.alphaValue = 1
+                }
+            })
+        }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: NSGestureRecognizer) -> Bool {
+        if let toggleButton = controlsToggleButton {
+            let point = gestureRecognizer.location(in: toggleButton)
+            if toggleButton.bounds.contains(point) {
+                return false
+            }
+        }
+
+        if let container = controlsContainer, !container.isHidden {
+            let point = gestureRecognizer.location(in: container)
+            if container.bounds.contains(point) {
+                return false
+            }
+        }
+
+        return true
     }
     
     

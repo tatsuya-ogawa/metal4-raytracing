@@ -7,6 +7,7 @@
 
 import MetalKit
 import ModelIO
+import ObjectiveC.runtime
 
 struct ModelMaterialOverride {
     var baseColor: SIMD3<Float>?
@@ -377,39 +378,227 @@ class Skeleton {
     }
     
     func computeGlobalTransforms(localTransforms: [matrix_float4x4]) -> [matrix_float4x4] {
-        var globals = localTransforms
-        for (i, parentIndex) in parentIndices.enumerated() {
-            if parentIndex >= 0 && parentIndex < i { // Assumption: parents always come before children
-                globals[i] = globals[parentIndex] * localTransforms[i]
+        guard localTransforms.count == parentIndices.count else { return localTransforms }
+
+        var globals = Array(repeating: matrix_identity_float4x4, count: localTransforms.count)
+        var resolutionState = Array(repeating: UInt8(0), count: localTransforms.count)
+
+        func resolveGlobalTransform(for jointIndex: Int) -> matrix_float4x4 {
+            if resolutionState[jointIndex] == 2 {
+                return globals[jointIndex]
             }
+            if resolutionState[jointIndex] == 1 {
+                // Break malformed parent cycles by treating the current local transform as authoritative.
+                return localTransforms[jointIndex]
+            }
+
+            resolutionState[jointIndex] = 1
+            let parentIndex = parentIndices[jointIndex]
+            if parentIndex >= 0 && parentIndex < localTransforms.count {
+                globals[jointIndex] = resolveGlobalTransform(for: parentIndex) * localTransforms[jointIndex]
+            } else {
+                globals[jointIndex] = localTransforms[jointIndex]
+            }
+            resolutionState[jointIndex] = 2
+            return globals[jointIndex]
+        }
+
+        for jointIndex in localTransforms.indices {
+            _ = resolveGlobalTransform(for: jointIndex)
         }
         return globals
     }
 }
 
 class AnimationClip {
+    let startTime: TimeInterval
+    let endTime: TimeInterval
     let duration: TimeInterval
     let translations: MDLAnimatedVector3Array
     let rotations: MDLAnimatedQuaternionArray
     let scales: MDLAnimatedVector3Array
     let jointPaths: [String]
+    fileprivate let translationTrack: Float3AnimationTrack?
+    fileprivate let rotationTrack: QuaternionAnimationTrack?
+    fileprivate let scaleTrack: Float3AnimationTrack?
     
     init(from packed: MDLPackedJointAnimation) {
         self.translations = packed.translations
         self.rotations = packed.rotations
         self.scales = packed.scales
         self.jointPaths = packed.jointPaths
+        self.translationTrack = Float3AnimationTrack(array: packed.translations)
+        self.rotationTrack = QuaternionAnimationTrack(array: packed.rotations)
+        self.scaleTrack = Float3AnimationTrack(array: packed.scales)
         
         let maxTime = max(translations.maximumTime, max(rotations.maximumTime, scales.maximumTime))
         let minTime = min(translations.minimumTime, min(rotations.minimumTime, scales.minimumTime))
+        self.startTime = minTime
+        self.endTime = maxTime
         self.duration = maxTime - minTime
     }
     
     func sample(at time: TimeInterval) -> ([SIMD3<Float>], [simd_quatf], [SIMD3<Float>]) {
-        let t = translations.float3Array(atTime: time)
-        let r = rotations.floatQuaternionArray(atTime: time)
-        let s = scales.float3Array(atTime: time)
+        let sampleTime: TimeInterval
+        if duration > 0 {
+            let wrappedTime = time.truncatingRemainder(dividingBy: duration)
+            let positiveWrappedTime = wrappedTime >= 0 ? wrappedTime : wrappedTime + duration
+            sampleTime = startTime + positiveWrappedTime
+        } else {
+            sampleTime = startTime
+        }
+
+        let clampedSampleTime = min(max(sampleTime, startTime), endTime)
+        let t = translationTrack?.sampleAll(at: clampedSampleTime) ?? translations.float3Array(atTime: clampedSampleTime)
+        let r = rotationTrack?.sampleAll(at: clampedSampleTime) ?? rotations.floatQuaternionArray(atTime: clampedSampleTime)
+        let s = scaleTrack?.sampleAll(at: clampedSampleTime) ?? scales.float3Array(atTime: clampedSampleTime)
         return (t, r, s)
+    }
+}
+
+fileprivate struct Float3AnimationTrack {
+    let elementCount: Int
+    let keyTimes: [TimeInterval]
+    let values: [SIMD3<Float>]
+
+    init?(array: MDLAnimatedVector3Array) {
+        self.elementCount = array.elementCount
+        self.keyTimes = array.keyTimes.map(\.doubleValue)
+
+        let sampleCount = max(1, max(array.timeSampleCount, keyTimes.count))
+        let totalCount = elementCount * sampleCount
+        guard totalCount > 0 else { return nil }
+
+        var rawValues = Array(repeating: SIMD3<Float>(repeating: 0), count: totalCount)
+        let copiedCount = rawValues.withUnsafeMutableBufferPointer { buffer -> Int in
+            guard let baseAddress = buffer.baseAddress else { return 0 }
+            return callFloat3ArrayGetter(object: array,
+                                         selectorName: "getFloat3Array:maxCount:",
+                                         output: baseAddress,
+                                         maxCount: totalCount)
+        }
+        guard copiedCount >= elementCount else { return nil }
+
+        if copiedCount == totalCount {
+            self.values = rawValues
+        } else {
+            self.values = Array(rawValues.prefix(copiedCount))
+        }
+    }
+
+    func sampleAll(at time: TimeInterval) -> [SIMD3<Float>] {
+        (0..<elementCount).map { sample(elementAt: $0, time: time) }
+    }
+
+    private func sample(elementAt index: Int, time: TimeInterval) -> SIMD3<Float> {
+        if values.isEmpty {
+            return SIMD3<Float>(repeating: 0)
+        }
+        if keyTimes.count <= 1 {
+            return values[safe: index] ?? SIMD3<Float>(repeating: 0)
+        }
+
+        let upperIndex = keyTimes.partitioningIndex { $0 > time }
+        if upperIndex <= 0 {
+            return value(timeIndex: 0, elementIndex: index)
+        }
+        if upperIndex >= keyTimes.count {
+            return value(timeIndex: keyTimes.count - 1, elementIndex: index)
+        }
+
+        let lowerIndex = upperIndex - 1
+        let t0 = keyTimes[lowerIndex]
+        let t1 = keyTimes[upperIndex]
+        let v0 = value(timeIndex: lowerIndex, elementIndex: index)
+        let v1 = value(timeIndex: upperIndex, elementIndex: index)
+
+        guard abs(t1 - t0) > 1.0e-8 else { return v0 }
+        let alpha = Float((time - t0) / (t1 - t0))
+        return simd_mix(v0, v1, SIMD3<Float>(repeating: alpha))
+    }
+
+    private func value(timeIndex: Int, elementIndex: Int) -> SIMD3<Float> {
+        let flatIndex = timeIndex * elementCount + elementIndex
+        if flatIndex >= 0 && flatIndex < values.count {
+            return values[flatIndex]
+        }
+        return values[safe: elementIndex] ?? SIMD3<Float>(repeating: 0)
+    }
+}
+
+fileprivate struct QuaternionAnimationTrack {
+    let elementCount: Int
+    let keyTimes: [TimeInterval]
+    let values: [simd_quatf]
+
+    init?(array: MDLAnimatedQuaternionArray) {
+        self.elementCount = array.elementCount
+        self.keyTimes = array.keyTimes.map(\.doubleValue)
+
+        let sampleCount = max(1, max(array.timeSampleCount, keyTimes.count))
+        let totalCount = elementCount * sampleCount
+        guard totalCount > 0 else { return nil }
+
+        var rawValues = Array(repeating: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1), count: totalCount)
+        let copiedCount = rawValues.withUnsafeMutableBufferPointer { buffer -> Int in
+            guard let baseAddress = buffer.baseAddress else { return 0 }
+            return callQuaternionArrayGetter(object: array,
+                                             selectorName: "getFloatQuaternionArray:maxCount:",
+                                             output: baseAddress,
+                                             maxCount: totalCount)
+        }
+        guard copiedCount >= elementCount else { return nil }
+
+        let effectiveValues = copiedCount == totalCount ? rawValues : Array(rawValues.prefix(copiedCount))
+        self.values = effectiveValues.map { quaternion in
+            let length = simd_length(quaternion.vector)
+            guard length > 1.0e-8 else {
+                return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            }
+            return simd_quatf(vector: quaternion.vector / length)
+        }
+    }
+
+    func sampleAll(at time: TimeInterval) -> [simd_quatf] {
+        (0..<elementCount).map { sample(elementAt: $0, time: time) }
+    }
+
+    private func sample(elementAt index: Int, time: TimeInterval) -> simd_quatf {
+        if values.isEmpty {
+            return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        }
+        if keyTimes.count <= 1 {
+            return values[safe: index] ?? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+        }
+
+        let upperIndex = keyTimes.partitioningIndex { $0 > time }
+        if upperIndex <= 0 {
+            return value(timeIndex: 0, elementIndex: index)
+        }
+        if upperIndex >= keyTimes.count {
+            return value(timeIndex: keyTimes.count - 1, elementIndex: index)
+        }
+
+        let lowerIndex = upperIndex - 1
+        let t0 = keyTimes[lowerIndex]
+        let t1 = keyTimes[upperIndex]
+        let q0 = value(timeIndex: lowerIndex, elementIndex: index)
+        var q1 = value(timeIndex: upperIndex, elementIndex: index)
+        if simd_dot(q0.vector, q1.vector) < 0 {
+            q1 = simd_quatf(vector: -q1.vector)
+        }
+
+        guard abs(t1 - t0) > 1.0e-8 else { return q0 }
+        let alpha = Float((time - t0) / (t1 - t0))
+        return simd_slerp(q0, q1, alpha)
+    }
+
+    private func value(timeIndex: Int, elementIndex: Int) -> simd_quatf {
+        let flatIndex = timeIndex * elementCount + elementIndex
+        if flatIndex >= 0 && flatIndex < values.count {
+            return values[flatIndex]
+        }
+        return values[safe: elementIndex] ?? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
     }
 }
 
@@ -503,6 +692,54 @@ func matrix4x4_trs(translation: SIMD3<Float>, rotation: simd_quatf, scale: SIMD3
     let rotationMatrix = matrix_float4x4(rotation)
     let scaleMatrix = matrix_float4x4.scale(scale)
     return translationMatrix * rotationMatrix * scaleMatrix
+}
+
+private func callFloat3ArrayGetter(object: NSObject,
+                                   selectorName: String,
+                                   output: UnsafeMutablePointer<SIMD3<Float>>,
+                                   maxCount: Int) -> Int {
+    let selector = NSSelectorFromString(selectorName)
+    guard object.responds(to: selector) else { return 0 }
+    typealias Getter = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<SIMD3<Float>>, Int) -> Int
+    let implementation = object.method(for: selector)
+    let function = unsafeBitCast(implementation, to: Getter.self)
+    return function(object, selector, output, maxCount)
+}
+
+private func callQuaternionArrayGetter(object: NSObject,
+                                       selectorName: String,
+                                       output: UnsafeMutablePointer<simd_quatf>,
+                                       maxCount: Int) -> Int {
+    let selector = NSSelectorFromString(selectorName)
+    guard object.responds(to: selector) else { return 0 }
+    typealias Getter = @convention(c) (AnyObject, Selector, UnsafeMutablePointer<simd_quatf>, Int) -> Int
+    let implementation = object.method(for: selector)
+    let function = unsafeBitCast(implementation, to: Getter.self)
+    return function(object, selector, output, maxCount)
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        guard indices.contains(index) else { return nil }
+        return self[index]
+    }
+}
+
+private extension RandomAccessCollection {
+    func partitioningIndex(where predicate: (Element) -> Bool) -> Index {
+        var low = startIndex
+        var high = endIndex
+        while low != high {
+            let distance = self.distance(from: low, to: high)
+            let mid = index(low, offsetBy: distance / 2)
+            if predicate(self[mid]) {
+                high = mid
+            } else {
+                low = index(after: mid)
+            }
+        }
+        return low
+    }
 }
 
 // Extensions moved to Utilities.swift or use existing ones

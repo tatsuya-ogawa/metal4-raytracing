@@ -9,6 +9,11 @@ import Metal
 import simd
 import QuartzCore
 
+private struct SkinningUniformsCPU {
+    var vertexCount: UInt32
+    var jointCount: UInt32
+}
+
 class SkinningPass {
     let device: MTLDevice
     
@@ -97,9 +102,10 @@ class SkinningPass {
                     let nrmBuffer = device.makeBuffer(length: posSize, options: .storageModePrivate)!
                     nrmBuffer.label = "Skinned Normal - model\(i)"
                     
-                    var vertexCountU32 = UInt32(vertexCount)
-                    let uniformBuffer = device.makeBuffer(bytes: &vertexCountU32,
-                                                          length: MemoryLayout<UInt32>.stride,
+                    var uniforms = SkinningUniformsCPU(vertexCount: UInt32(vertexCount),
+                                                       jointCount: UInt32(safeJointCount))
+                    let uniformBuffer = device.makeBuffer(bytes: &uniforms,
+                                                          length: MemoryLayout<SkinningUniformsCPU>.stride,
                                                           options: CommonStorageMode.options)!
                     uniformBuffer.label = "Skinning Uniforms - model\(i)"
                     
@@ -156,6 +162,17 @@ class SkinningPass {
 #endif
         return jointCount
     }
+
+    func updateSkinningUniforms(vertexCount: Int, jointCount: Int, destinationBuffer: MTLBuffer) {
+        guard destinationBuffer.length >= MemoryLayout<SkinningUniformsCPU>.stride else { return }
+        let safeVertexCount = UInt32(max(0, vertexCount))
+        let safeJointCount = UInt32(max(0, jointCount))
+        let dst = destinationBuffer.contents().bindMemory(to: SkinningUniformsCPU.self, capacity: 1)
+        dst[0] = SkinningUniformsCPU(vertexCount: safeVertexCount, jointCount: safeJointCount)
+#if os(macOS)
+        destinationBuffer.didModifyRange(0..<MemoryLayout<SkinningUniformsCPU>.stride)
+#endif
+    }
     
     /// Dispatch skinning kernel for all skinned meshes using provided encoder
     func dispatchSkinning(computeEncoder: MTL4ComputeCommandEncoder, scene: Scene) {
@@ -168,7 +185,7 @@ class SkinningPass {
                 
                 // Joint matrices
                 let jointBuffer = jointMatrixBuffers[skinnedIndex]
-                updateSkinningJointMatrices(model: model, mesh: mesh, destinationBuffer: jointBuffer)
+                let jointCount = updateSkinningJointMatrices(model: model, mesh: mesh, destinationBuffer: jointBuffer)
                 skinningTable.setAddress(jointBuffer.gpuAddress, index: BufferIndex.jointMatrices.rawValue)
                 
                 // Source buffers
@@ -197,11 +214,13 @@ class SkinningPass {
                 skinningTable.setAddress(destNrm.gpuAddress, index: BufferIndex.skinnedNormals.rawValue)
                 
                 // Uniforms
-                skinningTable.setAddress(skinningUniformBuffers[skinnedIndex].gpuAddress, index: BufferIndex.uniforms.rawValue)
+                let uniformBuffer = skinningUniformBuffers[skinnedIndex]
+                let vertexCount = mesh.mtkMesh.vertexCount
+                updateSkinningUniforms(vertexCount: vertexCount, jointCount: jointCount, destinationBuffer: uniformBuffer)
+                skinningTable.setAddress(uniformBuffer.gpuAddress, index: BufferIndex.uniforms.rawValue)
                 
                 // Dispatch
                 computeEncoder.setArgumentTable(skinningTable)
-                let vertexCount = mesh.mtkMesh.vertexCount
                 let threadsPerGrid = MTLSize(width: vertexCount, height: 1, depth: 1)
                 let threadsPerGroup = MTLSize(width: min(vertexCount, skinningPipelineState.maxTotalThreadsPerThreadgroup), height: 1, depth: 1)
                 computeEncoder.dispatchThreads(threadsPerGrid: threadsPerGrid, threadsPerThreadgroup: threadsPerGroup)
@@ -222,7 +241,7 @@ class SkinningPass {
 
                 // Joint matrices
                 let jointBuffer = jointMatrixBuffers[skinnedIndex]
-                updateSkinningJointMatrices(model: model, mesh: mesh, destinationBuffer: jointBuffer)
+                let jointCount = updateSkinningJointMatrices(model: model, mesh: mesh, destinationBuffer: jointBuffer)
                 computeEncoder.setBuffer(jointBuffer, offset: 0, index: BufferIndex.jointMatrices.rawValue)
 
                 // Source buffers
@@ -259,12 +278,14 @@ class SkinningPass {
                 computeEncoder.setBuffer(destNrm, offset: 0, index: BufferIndex.skinnedNormals.rawValue)
 
                 // Uniforms
-                computeEncoder.setBuffer(skinningUniformBuffers[skinnedIndex],
+                let uniformBuffer = skinningUniformBuffers[skinnedIndex]
+                let vertexCount = mesh.mtkMesh.vertexCount
+                updateSkinningUniforms(vertexCount: vertexCount, jointCount: jointCount, destinationBuffer: uniformBuffer)
+                computeEncoder.setBuffer(uniformBuffer,
                                          offset: 0,
                                          index: BufferIndex.uniforms.rawValue)
 
                 // Dispatch
-                let vertexCount = mesh.mtkMesh.vertexCount
                 let threadsPerGrid = MTLSize(width: vertexCount, height: 1, depth: 1)
                 let threadsPerGroup = MTLSize(width: min(vertexCount, skinningPipelineState.maxTotalThreadsPerThreadgroup),
                                               height: 1,
